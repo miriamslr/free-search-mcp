@@ -335,6 +335,38 @@ async def test_a_desynced_index_is_rebuilt_instead_of_reported_as_empty(fresh_ca
     await fresh_cache.close()
 
 
+async def test_a_desync_is_classified_the_same_under_either_sqlite_wording():
+    """SQLite 3.42+ names the condition; older builds only say the file is
+    malformed. The repair must trigger on both, so the classifier keys on the
+    one case that must NOT repair rather than on corruption wording."""
+    import sqlite3
+
+    from search_mcp.cache import _is_bad_match_query
+
+    for text in (
+        "fts5: missing row 9999 from content table 'main'.'pages'",
+        "database disk image is malformed",
+        "database or disk is full",
+    ):
+        assert not _is_bad_match_query(sqlite3.OperationalError(text)), text
+
+
+async def test_a_bad_match_query_is_never_treated_as_corruption():
+    """Rebuilding on the caller's typo would turn a one-character mistake into
+    an O(corpus) reindex on every such query."""
+    import sqlite3
+
+    from search_mcp.cache import _is_bad_match_query
+
+    for text in (
+        'fts5: syntax error near ""',
+        "no such column: nosuchcol",
+        "unknown special query: foo",
+        "unterminated string",
+    ):
+        assert _is_bad_match_query(sqlite3.OperationalError(text)), text
+
+
 async def test_a_malformed_query_is_still_just_no_matches(fresh_cache):
     """The rebuild path must not swallow the syntax-error path it sits next
     to — a bad query is a user error, not a corrupt index."""

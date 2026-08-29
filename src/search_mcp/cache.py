@@ -61,16 +61,29 @@ END;
 """
 
 
-def _is_fts_desync(exc: BaseException) -> bool:
-    """True for FTS5's "the index and the content table disagree" errors.
+# A malformed MATCH query is the caller's input and must never trigger a repair.
+# Everything else that SQLite can raise here is treated as a possible index
+# desync, because the wording of that one is not portable: external-content
+# FTS5 reads column values back from `pages` by rowid, and a posting for a row
+# that is gone surfaces as `fts5: missing row N from content table …` on
+# SQLite 3.42+ but as a bare SQLITE_CORRUPT_VTAB ("database disk image is
+# malformed") on older builds — which is what the distro SQLite behind some
+# CI interpreters still reports. Matching on the corruption wording therefore
+# fails silently on exactly the installs most likely to hold a poisoned cache.
+# Classifying the safe-to-ignore case instead is version-independent, and the
+# cost of being wrong is one bounded rebuild.
+_BAD_MATCH_MARKERS = (
+    "syntax error",
+    "no such column",
+    "unknown special query",
+    "unterminated string",
+)
 
-    External-content FTS5 stores only the postings and reads column values back
-    from `pages` by rowid, so a posting for a row that is gone is reported as
-    `fts5: missing row N from content table 'main'.'pages'` — a corruption
-    signal, not the malformed-query error the caller's handler is written for.
-    """
+
+def _is_bad_match_query(exc: BaseException) -> bool:
+    """True when the MATCH expression itself is invalid, e.g. `a AND` or `x:1`."""
     text = str(exc).lower()
-    return "fts5" in text and ("missing row" in text or "corrupt" in text)
+    return any(marker in text for marker in _BAD_MATCH_MARKERS)
 
 
 # Bumped when an existing cache FILE needs work that `CREATE TABLE IF NOT
@@ -368,15 +381,21 @@ class Cache:
             )
             rows = await cur.fetchall()
         except (sqlite3.OperationalError, aiosqlite.Error) as exc:
-            if _is_fts_desync(exc) and not _retrying:
-                # NOT a malformed query: the index points at rows the content
-                # table no longer has. Rebuilding is the documented repair and
-                # is cheap relative to having the feature silently return
-                # nothing, which is what the blanket handler below did for
-                # every query against a desynced index.
-                log.warning("%s: rebuilding desynced FTS index (%s)", self._path, exc)
-                await conn.execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')")
-                await conn.commit()
+            if not _retrying and not _is_bad_match_query(exc):
+                # Not the caller's query: most likely the index points at rows
+                # the content table no longer has. Rebuilding is the documented
+                # repair and is cheap relative to having the feature silently
+                # return nothing, which is what the blanket handler below did
+                # for every query against a desynced index.
+                log.warning("%s: rebuilding FTS index (%s)", self._path, exc)
+                try:
+                    await conn.execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')")
+                    await conn.commit()
+                except (sqlite3.OperationalError, aiosqlite.Error) as rebuild_exc:
+                    # Damage a rebuild cannot undo. Still not the caller's
+                    # problem to see as a traceback.
+                    log.warning("%s: FTS rebuild failed (%s)", self._path, rebuild_exc)
+                    return []
                 return await self.search_pages(query, limit, _retrying=True)
             # Malformed FTS5 MATCH input (e.g. 'a AND', a bare quote, or a
             # 'col:val' phrase against an unknown column) raises a SQLite
