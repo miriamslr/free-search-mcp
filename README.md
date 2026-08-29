@@ -125,10 +125,12 @@ stripping). Each fetched page also returns `author`, `published_date`, and
 `sitename` for free.
 
 "Filters" means search/research accept `freshness`, `include_domains`,
-`exclude_domains`, `category`
-(`news`/`pdf`/`github`/`paper`/`forum`/`blog`/`image`/`dataset`),
-`include_text`, `exclude_text`. `category` also **routes** the query to
-sources that natively index it — see [Vertical sources](#vertical-sources-selected-automatically-by-category).
+`exclude_domains`, `category`, `include_text`, `exclude_text`. `category` also
+**routes** the query to sources that natively index it: a bare group
+(`news`/`pdf`/`github`/`paper`/`forum`/`blog`/`image`/`dataset`/`finance`)
+widens, and a dotted sub-group (`paper.biomed`, `finance.filings`, …) narrows
+to just the sources that index it — see
+[Vertical sources](#vertical-sources-selected-automatically-by-category).
 
 ### Anti-detection &amp; resilience
 
@@ -154,19 +156,20 @@ sources that natively index it — see [Vertical sources](#vertical-sources-sele
 
 ---
 
-## Tools (10)
+## Tools (11)
 
 | Tool | Description |
 |---|---|
 | `search(query, ...filters)` | Parallel multi-engine search, RRF-merged, title-fuzzy + host-canonical deduped, with optional extractive `lead_snippet` |
 | `research(question, depth?, ...filters)` | One-shot: search + fetch top N + return Markdown brief |
+| `paper_graph(paper, direction?, limit?)` | Walk one paper's citation graph — references, citing works ranked by influence, and Crossref retraction/correction notices |
 | `compare(question, urls=[2..5])` | Concurrent fetch of 2-5 URLs, side-by-side excerpts keyed by question |
 | `fetch(url, render?, inline?, ...)` | Fetch any resource: reader-mode Markdown for pages, parsed text for documents, or a description (type/size/dimensions/sha256) for images and binaries. `inline=True` returns the image itself for vision models |
 | `fetch_batch(urls, ...)` | Concurrent multi-URL fetch (max 20 per call) |
 | `read_doc(source, start?, length?, ...)` | Parse PDF / DOCX / XLSX / PPTX / EPUB / CSV / code / zip-tar / HTML / TXT / MD with pagination |
 | `extract_structured(url, ...)` | Pull JSON-LD / OpenGraph / Twitter cards / microdata via extruct |
 | `cache_search(query, limit?, ...)` | FTS5 search across previously fetched pages |
-| `engines()` | List engine names available to `search` |
+| `engines(group?)` | The source tree — group → sub-group → engine, one line each |
 | `download(url, ...)` | Save a file to `${SEARCH_MCP_CACHE_DIR}/downloads` by default; files auto-delete after 24h. Set `SEARCH_MCP_DOWNLOAD_ENABLED=false` to disable it. |
 
 Plus **4 MCP prompts** (`Research thoroughly`, `Fact-check claim`,
@@ -180,7 +183,7 @@ Plus **4 MCP prompts** (`Research thoroughly`, `Fact-check claim`,
 | `freshness` | `day` / `week` / `month` / `year` | Only results from the last N |
 | `include_domains` | `["python.org", "djangoproject.com"]` | Restrict to these domains |
 | `exclude_domains` | `["pinterest.com"]` | Remove these |
-| `category` | `news` / `pdf` / `github` / `paper` / `forum` / `blog` | Content-type shortcut (paper = arxiv/acm/ieee/…, forum = reddit/HN/SE, etc.) |
+| `category` | a group (`paper`, `finance`, `news`, …) or a sub-group (`paper.biomed`, `finance.filings`, …) | Routes to the sources that natively index that kind of thing; the enum in the tool schema lists every value |
 | `include_text` | `"async"` | Substring required in title/snippet |
 | `exclude_text` | `"beginner"` | Substring forbidden |
 | `max_age_hours` | `24` | Override the 7-day default cache TTL on this call |
@@ -235,6 +238,13 @@ Opt-in:
 - `wikipedia` — encyclopedia search; language follows `SEARCH_MCP_REGION`.
 - `openlibrary` — book search over the Internet Archive catalogue.
 
+Scholarly and financial sources are keyless too, and are normally reached via
+`category=` rather than by name: `arxiv`, `openalex`, `crossref`, `pubmed`,
+`europepmc`, `dblp`, `doaj`, `clinicaltrials`, `zenodo` — and `sec_edgar`,
+`yahoofinance`, `cninfo`, `worldbank`, `imf`. `semanticscholar` is registered
+alongside them but its anonymous pool answers 429 in practice, so it stays out
+of automatic routing until a (free) key is configured.
+
 > All keyless engines stay **opt-in** — they're not in the fast default pool,
 > so the ~2x latency win of the all-HTTP defaults is preserved. Enable per
 > call with `engines=["google","bilibili", ...]`, or globally via
@@ -243,21 +253,45 @@ Opt-in:
 ### Vertical sources (selected automatically by `category`)
 
 These index something a general web engine can't. You normally **don't name
-them** — passing `category=` to `search`/`research` routes to them:
+them** — passing `category=` to `search`/`research` routes to them. Sources are
+organised as **group → sub-group**: a bare group widens (one specialist per
+sub-group joins the web pool), a dotted sub-group narrows to exactly the
+sources that index it.
 
 | `category` | Engines | Why it matters |
 |---|---|---|
-| `paper` | `arxiv`, `openalex`, `crossref`, `pubmed` | Actually searches the literature instead of filtering web results by hostname |
+| `paper` | one per sub-group, below | Actually searches the literature instead of filtering web results by hostname |
+| `paper.index` | `openalex`, `crossref`, `semanticscholar` | Cross-discipline DOI indexes with citation counts |
+| `paper.preprint` | `arxiv`, `europepmc` (`SRC:"PPR"`) | Work that has not been peer reviewed yet, flagged as such |
+| `paper.biomed` | `europepmc`, `pubmed` | MEDLINE and its 40M-record superset, with open-access full text |
+| `paper.cs` | `dblp` | Curated CS bibliography: exact venues, authors, DOIs |
+| `paper.openaccess` | `doaj`, `europepmc` | Every hit is free to read in full, so `read_doc` can open it |
+| `paper.trial` | `clinicaltrials` | Registered human trials — evidence the literature has not caught up with |
+| `finance` | one per sub-group, below | No general engine indexes filings, quotes or macro series |
+| `finance.filings` | `sec_edgar`, `cninfo` | Regulatory filings in full text (US, and A-share/HK) |
+| `finance.market` | `yahoofinance` | Ticker resolution plus market news for the resolved instrument |
+| `finance.macro` | `worldbank`, `imf` | World Bank research and IMF DataMapper series, WEO forecasts included |
 | `github` | `github` (repos + issues/PRs), `github_code` (needs a token) | Real repository metadata, stars, last push |
 | `forum` | `stackexchange`, `hackernews` | Accepted-answer and score signals |
-| `news` | `googlenews`, `gdelt` | GDELT covers 100+ languages Google News never surfaces |
+| `news` / `news.world` | `googlenews`, `gdelt` | GDELT covers 100+ languages Google News never surfaces |
 | `image` | `openverse` | Openly-licensed images; results are direct file URLs, so `fetch(inline=True)` works on them |
 | `dataset` | `zenodo` | Datasets, software and their DOIs |
 
 `image` and `dataset` **replace** the default pool rather than adding to it —
 a web engine can't return an image file or a dataset record, so mixing it in
 only crowds out the source that can. The others augment it, capped by
-`SEARCH_MCP_CATEGORY_ENGINE_LIMIT` (default 3).
+`SEARCH_MCP_CATEGORY_ENGINE_LIMIT` (default 3). Because that cap is smaller
+than most groups, a bare group **round-robins across its sub-groups** before
+truncating: `category="paper"` spends its three slots on three different
+corpora rather than on three overlapping DOI indexes.
+
+Results from an engine that natively indexes the requested category count
+**double** in the rank fusion. Without that, `category=` barely affected the
+order: a specialist is usually the only source returning a given document, so
+its hit lost to three general engines agreeing on a blog post about the topic.
+
+`engines()` prints this tree live from the registry — it is derived from what
+each engine declares, so it cannot drift from what actually runs.
 
 Naming engines explicitly (`engines=[...]`) turns the routing off.
 
@@ -281,6 +315,7 @@ configured" hint) until you add a key:
 | `anysearch` | [AnySearch](https://anysearch.com) (key optional) | keyless works; key lifts limits |
 | `github_code` | [GitHub](https://github.com/settings/tokens) | code search is auth-only; the keyless `github` engine covers repos + issues |
 | `stackexchange` | [Stack Apps](https://stackapps.com/apps/oauth/register) (key optional) | 300 req/day keyless; a key lifts the quota |
+| `semanticscholar` | [Semantic Scholar](https://www.semanticscholar.org/product/api#api-key) (key optional) | the anonymous pool answers 429 in practice; a free key makes it usable |
 
 **Simplest setup — the admin UI:**
 
@@ -487,7 +522,7 @@ Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`
 (Source checkout: `"command": "uv", "args": ["--directory",
 "/absolute/path/to/free-search-mcp", "run", "search-mcp"]`.)
 
-Restart Claude Desktop. The ten tools above will appear in the tool
+Restart Claude Desktop. The eleven tools above will appear in the tool
 drawer.
 
 ### Wire into other clients

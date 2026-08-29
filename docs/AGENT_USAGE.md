@@ -107,6 +107,12 @@ default.
 Use `extract_structured` when schema.org, OpenGraph, Twitter card, or microdata
 metadata matters more than prose.
 
+Use `paper_graph` for a specific paper rather than a topic: it takes a DOI, an
+OpenAlex ID or an exact title and returns what that paper cites, what cites it
+(ordered by how much the field cited those in turn), and any Crossref retraction
+or correction notice. Check it before repeating a citation — a retracted paper
+looks exactly like a standing one in a search result.
+
 Use `cache_search` only for pages previously fetched by this server. Treat it as
 local memory, not live web search.
 
@@ -124,12 +130,22 @@ Google-style SERP coverage, and keyed engines such as `brave_api`, `serper`,
 `tavily`, or `google_cse` only after keys are configured.
 
 **Prefer `category=` over naming engines.** It routes the query to sources that
-natively index that kind of content: `category="paper"` searches arXiv, OpenAlex
-and Crossref rather than filtering web results by hostname; `category="github"`
-reaches GitHub; `category="forum"` reaches Stack Exchange and Hacker News;
-`category="image"` reaches Openverse; `category="dataset"` reaches Zenodo.
-Passing `engines=` turns that routing off, so only do it when you specifically
-want one source.
+natively index that kind of content instead of filtering web results by
+hostname. Categories are two levels deep: a bare group widens, and a dotted
+sub-group narrows.
+
+- `category="paper"` reaches one specialist per scholarly sub-group; narrow
+  with `paper.biomed`, `paper.cs`, `paper.preprint`, `paper.openaccess`,
+  `paper.trial` or `paper.index` when the field is known.
+- `category="finance"` reaches filings, market data and macro research;
+  narrow with `finance.filings`, `finance.market` or `finance.macro`.
+- `category="github"` reaches GitHub, `"forum"` reaches Stack Exchange and
+  Hacker News, `"news"` reaches Google News and GDELT, `"image"` reaches
+  Openverse, `"dataset"` reaches Zenodo.
+
+Call `engines()` for the live tree with a line on each source; it is derived
+from the registry, so it always matches what actually runs. Passing `engines=`
+turns the routing off, so only do it when you specifically want one source.
 
 For non-text resources, `fetch` describes rather than decodes: an image returns
 its type, size and dimensions. Only pass `inline=True` when you actually need to
@@ -164,8 +180,9 @@ saved config file, or environment variables.
 ```text
 You have access to the `search` MCP server. Use `research` for broad
 source-backed answers, `search` for discovery, `fetch` for known URLs, `compare`
-for cross-source checks, and `read_doc` for documents. Cite URLs for factual
-claims. Treat gated engines and empty results as diagnostic signals, not final
+for cross-source checks, `read_doc` for documents, and `paper_graph` to check or
+expand a specific paper's citations. Prefer `category=` (e.g. "paper.biomed",
+"finance.filings") over naming engines. Cite URLs for factual claims. Treat gated engines and empty results as diagnostic signals, not final
 truth. Use default keyless engines first, and do not bypass CAPTCHAs or access
 controls.
 ```

@@ -64,13 +64,14 @@ docker compose run --rm search-mcp
 |---|---|
 | `search(query, engines?, max_results?, ...filters)` | Parallel multi-engine search, RRF-merged + deduped, optional `lead_snippet`. |
 | `research(question, depth?, ...filters)` | search + fetch top N + return a Markdown brief in one call. |
+| `paper_graph(paper, direction?, limit?)` | One paper's citation graph: what it cites, what cites it (ranked by influence), plus Crossref retraction / correction notices. |
 | `compare(question, urls=[2..5])` | Concurrent fetch of 2–5 URLs, side-by-side excerpts. |
 | `fetch(url, render?, inline?, ...)` | Fetch any resource: reader-mode Markdown for pages, parsed text for documents, or a description (type/size/dimensions/sha256) for images and binaries. `inline=True` returns the image itself for a vision model. |
 | `fetch_batch(urls, ...)` | Concurrent multi-URL fetch (max 20 per call). |
 | `read_doc(source, start?, length?, ...)` | Parse PDF / DOCX / XLSX / PPTX / EPUB / CSV / source code / zip-tar / HTML / TXT / MD with pagination. |
 | `extract_structured(url, ...)` | JSON-LD / OpenGraph / Twitter cards / microdata. |
 | `cache_search(query, limit?, ...)` | FTS5 search across previously fetched pages. |
-| `engines()` | List engine names accepted by `engines=`. |
+| `engines(group?)` | The source tree — group → sub-group → engine, one line of description each. |
 | `download(url, ...)` | Save a file to `${SEARCH_MCP_CACHE_DIR}/downloads` by default; files auto-delete after 24h. Set `SEARCH_MCP_DOWNLOAD_ENABLED=false` to disable it. |
 
 All tools default to `format="markdown"`; pass `format="json"` for structured
@@ -107,20 +108,50 @@ reports it as `rescued_via`.
 | `wikipedia` | MediaWiki API | language follows `SEARCH_MCP_REGION` |
 | `openlibrary` | Open Library | book search |
 
-**Vertical sources — selected automatically by `category=`, not usually named:**
+The scholarly and financial sources (`arxiv`, `openalex`, `crossref`,
+`pubmed`, `europepmc`, `dblp`, `doaj`, `clinicaltrials`, `zenodo`,
+`sec_edgar`, `yahoofinance`, `cninfo`, `worldbank`, `imf`) are keyless too;
+reach them with `category=` rather than by name.
+
+### Vertical sources — selected automatically by `category=`
+
+Not usually named directly. Sources are organised as **group → sub-group**: a
+bare group widens (one specialist per sub-group joins the pool), and a dotted
+sub-group narrows to exactly the sources that index it.
 
 | `category` | Engines | Notes |
 |---|---|---|
-| `paper` | `arxiv`, `openalex`, `crossref`, `pubmed` | real literature search, structured publication dates |
+| `paper` | one per sub-group | real literature search, structured publication dates |
+| `paper.index` | `openalex`, `crossref`, `semanticscholar` | cross-discipline DOI indexes with citation counts |
+| `paper.preprint` | `arxiv`, `europepmc` | not peer reviewed, and labelled `PREPRINT` in the snippet |
+| `paper.biomed` | `europepmc`, `pubmed` | MEDLINE plus its 40M-record superset |
+| `paper.cs` | `dblp` | curated CS bibliography — exact venue, authors, DOI |
+| `paper.openaccess` | `doaj`, `europepmc` | full text is free to read, so `read_doc` can open it |
+| `paper.trial` | `clinicaltrials` | registered trials, with phase / status / sponsor |
+| `finance` | one per sub-group | filings, market data and macro answer different questions |
+| `finance.filings` | `sec_edgar`, `cninfo` | US regulatory filings; A-share / HK announcements |
+| `finance.market` | `yahoofinance` | ticker resolution + news about the resolved instrument |
+| `finance.macro` | `worldbank`, `imf` | World Bank documents; IMF series incl. WEO forecasts |
 | `github` | `github`, `github_code` (keyed) | repos + issues/PRs; code search needs a token |
 | `forum` | `stackexchange`, `hackernews` | accepted-answer / score signals |
-| `news` | `googlenews`, `gdelt` | GDELT covers 100+ languages; strictly rate-limited, skipped rather than queued |
+| `news`, `news.world` | `googlenews`, `gdelt` | GDELT covers 100+ languages; strictly rate-limited, skipped rather than queued |
 | `image` | `openverse` | CC-licensed; direct file URLs, usable with `fetch(inline=True)` |
 | `dataset` | `zenodo` | datasets, software, DOIs |
 
 `image` and `dataset` **replace** the default pool; the rest augment it (capped
-by `SEARCH_MCP_CATEGORY_ENGINE_LIMIT`, default 3). Passing `engines=` disables
+by `SEARCH_MCP_CATEGORY_ENGINE_LIMIT`, default 3). Because that cap is smaller
+than most groups, a bare group round-robins across its sub-groups before
+truncating, so `category="paper"` spends its three slots on three different
+corpora instead of three overlapping DOI indexes. Passing `engines=` disables
 the routing.
+
+Results from an engine that natively indexes the requested category count
+**double** in the rank fusion, so `category=` changes the ORDER too — not just
+which engines run. A specialist is usually the only source returning a given
+document, and without the weighting its hit lost to three general engines
+agreeing on a blog post about the topic.
+
+`engines()` prints this table live from the registry, so it cannot drift.
 
 Enable globally via `SEARCH_MCP_DEFAULT_ENGINES` (JSON list) in `.env`.
 
@@ -134,6 +165,7 @@ Enable globally via `SEARCH_MCP_DEFAULT_ENGINES` (JSON list) in `.env`.
 | `google_cse` | Google Custom Search | `google_cse_api_key` + `google_cse_cx` | 100/day |
 | `github_code` | GitHub code search | `github_token` | keyless `github` covers repos/issues |
 | `stackexchange` | Stack Exchange | `stackexchange_key` (optional) | 300/day keyless |
+| `semanticscholar` | Semantic Scholar | `semanticscholar_api_key` (optional) | anonymous pool answers 429 in practice |
 
 Add keys the simple way:
 
@@ -187,7 +219,7 @@ when an engine was gated. See **[PROXY_AND_GATES.md](PROXY_AND_GATES.md)**.
 | `freshness` | `day` / `week` / `month` / `year` | only results from the last N |
 | `include_domains` | `["python.org"]` | restrict to these domains |
 | `exclude_domains` | `["pinterest.com"]` | remove these |
-| `category` | `news` / `pdf` / `github` / `paper` / `forum` / `blog` / `image` / `dataset` | content-type shortcut **and** routing signal — sends the query to sources that natively index it (see [Vertical sources](#vertical-sources--selected-automatically-by-category)) |
+| `category` | a group (`news` / `pdf` / `github` / `paper` / `forum` / `blog` / `image` / `dataset` / `finance`) or a sub-group (`paper.biomed`, `finance.filings`, …) | content-type shortcut **and** routing signal — sends the query to sources that natively index it (see [Vertical sources](#vertical-sources--selected-automatically-by-category)) |
 | `include_text` | `"async"` | substring required in title/snippet |
 | `exclude_text` | `"beginner"` | substring forbidden |
 | `max_age_hours` | `24` | override the 7-day cache TTL on this call |
@@ -195,6 +227,9 @@ when an engine was gated. See **[PROXY_AND_GATES.md](PROXY_AND_GATES.md)**.
 ```text
 research("LLM eval frameworks", depth=3, freshness="month", category="paper")
 search("kubernetes operators", include_domains=["github.com"], category="github")
+search("CRISPR base editing", category="paper.preprint")
+search("NVDA 10-K risk factors", category="finance.filings")
+paper_graph("10.1145/1571941.1572114")               # references + citing works
 ```
 
 When filters drop results so aggressively that ≤3 remain, the response includes

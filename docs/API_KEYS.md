@@ -46,6 +46,9 @@ configure. The full list of variable names:
 | Tavily (AI search) | `SEARCH_MCP_TAVILY_API_KEY` |
 | Google Custom Search | `SEARCH_MCP_GOOGLE_CSE_API_KEY` and `SEARCH_MCP_GOOGLE_CSE_CX` |
 | AnySearch (optional key) | `SEARCH_MCP_ANYSEARCH_API_KEY` |
+| Semantic Scholar (optional key) | `SEARCH_MCP_SEMANTICSCHOLAR_API_KEY` |
+| GitHub (optional token) | `SEARCH_MCP_GITHUB_TOKEN` |
+| Stack Exchange (optional key) | `SEARCH_MCP_STACKEXCHANGE_KEY` |
 
 Environment variables always **win over** values saved in the file, so existing
 12-factor / container deployments keep working unchanged.
@@ -181,6 +184,69 @@ search("...", engines=["anysearch"])
 
 ---
 
+## Semantic Scholar (optional key)
+
+Scholarly search with the richest metadata of the keyless literature sources:
+abstracts, citation counts, influential-citation counts and direct open-access
+PDF links.
+
+**Free tier: anonymous requests share one saturated pool and are answered with
+HTTP 429 in practice; a free key gives 1 request/second.**
+
+That is not a caution — every unauthenticated request made while building this
+engine came back 429. So without a key the engine stays out of automatic
+`category="paper"` routing (it would spend a slot on a guaranteed empty);
+naming it in `engines=["semanticscholar"]` still runs it.
+
+How to get a key:
+
+1. Request one at https://www.semanticscholar.org/product/api#api-key-form
+2. Approval is by email and takes a few days.
+3. Paste the key here; `category="paper"` will then include it.
+
+- Sign up: https://www.semanticscholar.org/product/api#api-key-form
+- Docs: https://api.semanticscholar.org/api-docs/graph
+- Environment variable: `SEARCH_MCP_SEMANTICSCHOLAR_API_KEY`
+
+---
+
+## GitHub (optional token)
+
+**Free tier: repo/issue search works keyless (10 req/min); a token raises it to
+30 req/min and unlocks the `github_code` engine.**
+
+The `github` engine searches repositories and issues with no token. A token
+raises the rate limit and enables `github_code`, because GitHub's code-search
+API rejects anonymous requests outright.
+
+How to get a token:
+
+1. Create one at https://github.com/settings/tokens
+2. **No scopes are needed** for searching public repositories.
+3. Paste it here.
+
+- Sign up: https://github.com/settings/tokens
+- Docs: https://docs.github.com/rest/search
+- Environment variable: `SEARCH_MCP_GITHUB_TOKEN`
+
+---
+
+## Stack Exchange (optional key)
+
+**Free tier: 300 requests/day per IP keyless; an app key raises the quota.**
+
+How to get a key:
+
+1. Register an app at https://stackapps.com/apps/oauth/register
+2. Only the **key** value is needed — not the client secret.
+3. Paste it here.
+
+- Sign up: https://stackapps.com/apps/oauth/register
+- Docs: https://api.stackexchange.com/docs
+- Environment variable: `SEARCH_MCP_STACKEXCHANGE_KEY`
+
+---
+
 ## Which should I pick?
 
 | Provider | Free tier | Best for |
@@ -190,3 +256,6 @@ search("...", engines=["anysearch"])
 | Tavily (AI search) | 1,000 credits/month | AI / LLM-oriented search workflows |
 | Google Custom Search | 100 queries/day | Official Google results; low daily volume (needs API key + cx) |
 | AnySearch | Keyless; key raises limits | Zero-setup use; add a key only to lift rate limits |
+| Semantic Scholar | Anonymous pool is 429 in practice | Literature search with citation counts and OA PDFs |
+| GitHub | Keyless 10/min; token 30/min | Repo and issue search; a token also unlocks code search |
+| Stack Exchange | 300/day keyless | Q&A with accepted-answer and score signals |

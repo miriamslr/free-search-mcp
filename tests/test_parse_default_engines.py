@@ -252,5 +252,17 @@ def test_bing_unwrap_rejects_anything_that_is_not_an_http_url(url):
     assert resolve_bing_url(url) == url
 
 
+def test_bing_unwrap_leaves_a_non_bing_url_with_a_u_parameter_alone():
+    """`u` is an ordinary parameter name. Searching the whole URL for it — as
+    the 0.9.2 implementation did — meant any link whose `u` value happened to
+    base64-decode into something starting with "http" was silently replaced by
+    it, handing the caller a URL that appeared nowhere in the SERP."""
+    import base64
+
+    payload = base64.urlsafe_b64encode(b"https://elsewhere.example/x").decode().rstrip("=")
+    victim = f"https://analytics.example/redirect?u=xx{payload}"
+    assert resolve_bing_url(victim) == victim
+
+
 def test_bing_parse_empty_shell_yields_nothing():
     assert BingEngine().parse("<html><body>something went wrong</body></html>") == []

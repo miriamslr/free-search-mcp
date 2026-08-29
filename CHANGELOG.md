@@ -4,6 +4,201 @@ All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 semantic versioning.
 
+## [0.10.0] - 2026-08-29
+
+Finance and scholarly literature get real sources instead of hostname filters,
+`category` becomes a two-level tree the agent can navigate, and a batch of
+accuracy bugs that quietly corrupted results are fixed.
+
+### Added
+
+- **Ten new keyless sources.** Finance: `sec_edgar` (US filings full text),
+  `cninfo` (A-share / HK announcements), `yahoofinance` (ticker resolution and
+  market news), `worldbank` (Documents & Reports), `imf` (DataMapper series,
+  WEO forecasts included). Scholarly: `europepmc` (40M life-science records
+  including preprints), `dblp` (computer science), `doaj` (open access),
+  `clinicaltrials` (registered human trials), and `semanticscholar` behind an
+  optional key. Before this, a finance query had no specialist source at all
+  and fell through to the general web pool.
+- **`category` is now a two-level tree.** A bare group widens, a dotted
+  sub-group narrows: `paper.index`, `paper.preprint`, `paper.biomed`,
+  `paper.cs`, `paper.openaccess`, `paper.trial`, `finance.filings`,
+  `finance.market`, `finance.macro`, `news.world`. Every token appears in the
+  tool schema's enum, so an agent discovers the whole tree without a second
+  call. Preprint search runs through Europe PMC's `SRC:"PPR"` clause because
+  bioRxiv's own API cannot keyword-search at all.
+- **`paper_graph` — the eleventh tool.** Takes a DOI, an OpenAlex ID or an
+  exact title and returns what the paper cites, what cites it (ordered by how
+  much the field cited those in turn, so a five-year-old paper leads to the
+  current state of the art), and any Crossref retraction, correction or
+  expression of concern. A full walk costs four HTTP requests regardless of
+  `limit`, because every neighbour's metadata is selected in the call that
+  lists it.
+- **`cache_search` returned "no cached pages match" for a cache full of
+  matches.** `put_page` used `INSERT OR REPLACE`, which resolves the url
+  conflict by deleting the old row and inserting a new one with a NEW rowid —
+  and SQLite fires DELETE triggers on that path only when `recursive_triggers`
+  is on, which it is not by default. So every re-fetch orphaned the old
+  rowid's postings in `pages_fts`. External-content FTS5 reads column values
+  back from `pages` by rowid, so the first orphan made every query raise
+  `fts5: missing row N from content table`, which the malformed-query handler
+  swallowed into an empty result. `put_page` now upserts (keeping the rowid),
+  existing cache files are rebuilt once on open, and a desynced index is
+  repaired on read instead of being reported as "nothing cached".
+- **Rate-limited engines are now reported.** `aggregator` wrote
+  `diagnostics["rate_limited"]` and nothing in the codebase ever read it, so a
+  `gdelt` search skipped for its 6/min bucket looked identical to one that
+  genuinely found nothing.
+
+### Changed
+
+- **`category=` now changes the ORDER of results, not just which engines run.**
+  A specialist is usually the only source returning a given document, so its
+  hit scored 1/61 under plain RRF while three general engines agreeing on a
+  blog post about the topic scored 3/61 and won — `category="finance.filings"`
+  put NVIDIA's actual 10-K fourth, behind commentary about it, and put A-share
+  announcements seventh behind Wikipedia. Engines that natively index the
+  requested category now count double in the fusion. Measured on 14 queries
+  against real engine output, scoring the one result a knowledgeable person
+  would call correct:
+
+  | | hit@1 | hit@3 | MRR |
+  |---|---|---|---|
+  | before | 6/14 | 9/14 | 0.605 |
+  | after | 8/14 | 13/14 | 0.747 |
+
+  Six queries improved and none regressed. Two other candidate changes were
+  measured on the same set and dropped for lack of evidence: retuning RRF's
+  damping constant moved MRR by under 0.01 at any value between 5 and 60, and
+  a lexical query/title overlap bonus made every configuration worse
+  (0.747 -> 0.645).
+- **`category="paper"` round-robins across its sub-groups before the engine
+  limit truncates.** `SEARCH_MCP_CATEGORY_ENGINE_LIMIT` (default 3) used to
+  hand all three slots to `arxiv`, `openalex` and `crossref` — and the last two
+  are both DOI indexes covering the same corpus. The three slots now buy three
+  different corpora, which also revives `pubmed`: it was the fourth engine in a
+  three-slot list, i.e. dead code that four separate documents advertised.
+- **`engines()` returns the source tree, derived from the registry.** The
+  hand-maintained buckets it replaces had drifted — they promoted `pubmed`
+  where it could never run and never mentioned `openverse` or `zenodo`. It
+  takes an optional `group=` and honours `format="json"` like every other tool.
+- **`Engine` gained a one-line `description`**, rendered by `engines()`, so
+  picking a source no longer means guessing from its name.
+
+### Fixed
+
+- **`bing`'s redirect unwrapping (shipped in 0.9.2) no longer rewrites URLs it
+  should leave alone.** It located the payload by searching the whole URL for
+  `u=`, but `u` is an ordinary parameter name that other sites use for their own
+  purposes, so a non-Bing link whose `u` value happened to base64-decode into
+  something starting with `http` was silently replaced by it. Unwrapping is now
+  gated on the URL actually being a `bing.com/ck/a` redirect, and the decoded
+  target must be an absolute `http://` or `https://` URL rather than merely
+  starting with those four characters.
+- **`brave` returned every result twice.** Its comma-joined selector matches
+  the same `div` through both branches and selectolax does not deduplicate, so
+  two real results parsed as four. Half of `max_results` was spent on
+  duplicates, and RRF scored each one twice, giving `brave` roughly double
+  weight in the merge. `mojeek`, `bing`, `baidu` and `searx` had the same
+  missing `seen` set with a smaller blast radius.
+- **`read_doc` ignored the charset and mangled every non-UTF-8 page.** Five
+  call sites hard-coded `decode("utf-8", errors="replace")` while the fetcher
+  had already retrieved the content type. GBK, Big5 and Shift-JIS documents
+  came back as replacement characters. They now go through the same
+  header-then-`<meta>` decoder the rest of the package uses.
+- **Crossref dates were wrong in two ways, and trusted anyway.** An internal
+  `null` in `date-parts` (`[[2024, null, 5]]`) was filtered out rather than
+  treated as a stop, promoting the day into the month slot; and a
+  year-only record was padded to `YYYY-01-01` and marked confident, so
+  `freshness="month"` dropped a paper actually published in December. Dates now
+  truncate at the first gap, and year-only precision is no longer confident.
+- **`sogou` and `so360` ignored `site:` / `-site:` / `filetype:`.** They were
+  the only two web engines that never called `augment_query_with_operators`, so
+  they returned unconstrained results that the post-filter then discarded
+  wholesale — `engines=["so360"], include_domains=["python.org"]` reliably
+  returned nothing.
+- **Merging two copies of a URL could throw away the trustworthy date.** The
+  representative was picked by snippet length, so a structured source with an
+  exact publication date lost to an HTML scrape with a longer teaser, and the
+  date was then dropped as empty. The merge is now field-wise: best date, and
+  longest snippet, from whichever copy has it.
+- **A cache hit erased the provenance of the search it replayed.** The first
+  query reported "duckduckgo was gated, `searx` rescued it"; the same query
+  inside the 7-day TTL reported an ordinary search. `gated_engines`,
+  `gated_hint` and `rescued_via` now travel with the cached rows.
+- **`google` could return a relative path as a result URL.** `_unwrap` only
+  understood the `q=` wrapper; Google's other form puts the target in `url=`
+  and leaves `q` empty, which `parse_qs` discards. The unwrapped value was also
+  never made absolute, so `fetch` could not open it and host-based filtering
+  silently dropped it.
+- **`fetch(max_age_hours=…)` never hit the cache for Google News links.** The
+  pre-check used the raw URL while the cache is keyed on the publisher URL the
+  fetcher resolves it to, so every call re-fetched.
+- **`sec_edgar` answered a ticker query with unrelated issuers' filings.**
+  EDGAR's relevance ranking is dominated by structured-product pricing
+  supplements, so "NVDA risk factors" led with four 497Ks from ProShares and
+  Investment Managers Series Trust that merely mention the ticker. A query that
+  writes a ticker as a ticker is now scoped with `entityName=`, which returns
+  NVIDIA's own 10-K and 10-Qs. The match is case-sensitive — lower-cased, the
+  ticker space is full of ordinary words (`IT`, `ALL`, `ON`, `NOW`, `GO`) — and
+  an empty scoped search is re-run unscoped, so a wrong guess costs a round
+  trip rather than the answer.
+- **The search header credited engines that produced nothing.**
+  `payload["engines"]` is the REQUEST — the list the cache key is built from —
+  and when a requested engine fails, the rescue pass substitutes another. The
+  header printed the request, so `search(engines=["serper"])` with no key
+  configured announced `engines: serper` above ten results that every
+  per-result byline correctly attributed to `bing`. The header now names the
+  engines that actually contributed and lists the rest separately.
+- **A dictionary entry passed as a scholarly source.** `_PAPER_HOSTS` lists
+  publisher domains and the matcher accepts any subdomain, which is what keeps
+  the list short — but the big presses also run dictionaries and bookshops on
+  the same domain. `category="paper"` on "what is reciprocal rank fusion"
+  dropped 54 of 56 raw results and kept Cambridge Dictionary's entry for the
+  WORD "reciprocal" as its single source. Known non-scholarly siblings are now
+  excluded before the allowlist is consulted.
+- **`category="image"` and `"dataset"` could be rescued into the web pool.**
+  `settings.rescue_engines` IS the general web pool, and the whole reason those
+  two categories REPLACE that pool is that a web engine cannot return an image
+  file or a dataset record. A sparse Openverse run therefore came back as HTML
+  pages that `fetch(inline=True)` cannot render, under a header saying the
+  search succeeded. Exclusive categories no longer rescue.
+- **`max_results` was unvalidated.** `n = max_results or default` turned an
+  explicit `0` into ten results with no sign anything had been ignored, and
+  four-figure values were passed to every engine in the fan-out. It is now
+  clamped to 1-50, with `None` still meaning "use the configured default".
+- **`paper_graph` resolved a title to whatever OpenAlex ranked first.**
+  "BERT pre-training of deep bidirectional transformers" returned BEiT's
+  citation graph under the heading the caller typed — the actual BERT paper is
+  not in OpenAlex's top five for that query at all, and a caller checking a
+  citation has no way to catch the substitution. A title now has to clear a
+  similarity gate that accepts a genuine prefix ("reciprocal rank fusion
+  outperforms condorcet") and rejects a neighbour; when nothing clears it, the
+  near misses are listed so the caller can retry precisely. DOI and OpenAlex-ID
+  lookups are exact and ungated.
+- **Blank arguments blamed the wrong thing.** `read_doc("")` answered "Local
+  file reads are disabled; set SEARCH_MCP_DOCUMENT_ROOT", sending the caller to
+  configure a sandbox they did not need; `cache_search("")` told them to
+  populate a cache that may already be full; `fetch_batch([])` returned an
+  empty string, which reads as "every fetch failed silently". Each now names
+  the argument that was wrong.
+- **IMF indicator matching preferred a code that is also a word.** Three of the
+  132 codes are ordinary words — `GDP` is Capital Flows' *nominal* GDP — so
+  "real gdp growth" matched the code shortcut and beat the indicator literally
+  called "Real GDP growth". The shortcut now requires the code typed as a code,
+  scoring is case-insensitive, and a label that merely contains the query no
+  longer ties with one that matches it.
+- **cninfo dated every announcement one day early.** Its epochs are exact
+  midnights in Beijing time, so rendering them as UTC landed at 16:00 the
+  previous day — visible in the payload itself, where the filing date in
+  `adjunctUrl` disagreed with `announcementTime` on every hit.
+- **`render_fetch` ran the body into the metadata line.** One newline where
+  `render_doc` uses two, on every default-format `fetch` and `fetch_batch`.
+- Smaller: `openalex` now sends `select=` (a 10-result page measured 174 KB
+  against 56 KB), `arxiv` uses HTTPS, `pubmed` no longer computes its
+  publication date twice, `zenodo` no longer recompiles a regex per call, and
+  `research` passes through the diagnostics fields it had been dropping.
+
 ## [0.9.2] - 2026-08-06
 
 ### Fixed
@@ -24,6 +219,8 @@ semantic versioning.
   now base64url-decoded to the real target; anything that is not a decodable
   wrapper passes through untouched, since a working redirect link still beats
   dropping the result. Present since the engine was added.
+
+## [0.9.1] - 2026-07-31
 
 ### Fixed
 
