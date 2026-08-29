@@ -18,3 +18,6 @@ freesearch-promo/
 .vscode/
 .idea/
 *.swp
+
+# Ranking-eval capture: a snapshot of a moving web, not a fixture.
+evals/ranking/buckets.json
