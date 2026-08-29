@@ -59,6 +59,9 @@ class AnySearchEngine(Engine):
     """AnySearch unified search REST API — anonymous (keyless), JSON POST."""
 
     name = "anysearch"
+    description = (
+        "Keyless JSON search aggregator; a good recovery when the HTML scrapers are gated."
+    )
     needs_browser = False
     # JSON API: an empty/malformed response is genuinely empty, so don't waste
     # a Playwright render trying to "recover" it (see Engine.search fallback).

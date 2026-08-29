@@ -85,6 +85,7 @@ class SearxEngine(Engine):
     """Meta-search via public SearXNG instances. No API key, no browser."""
 
     name = "searx"
+    description = "Meta-search across public SearXNG instances; several engines in one round trip."
     needs_browser = False
 
     # Kept so the abstract contract is satisfied and so callers that compute
@@ -115,6 +116,11 @@ class SearxEngine(Engine):
     def parse(self, html: str) -> list[SearchResult]:
         tree = parse_html(html)
         results: list[SearchResult] = []
+        seen: set[str] = set()
+        # Guard against a SERP repeating a URL (and against a future markup
+        # change re-introducing a double match): a duplicate inside one bucket
+        # scores twice in the aggregator's RRF merge, inflating this engine's
+        # weight, and eats a slot in the max_results budget.
         for art in tree.css("article.result"):
             classes = art.attributes.get("class") or ""
             # SearXNG marks ad-style entries; current public instances rarely
@@ -130,8 +136,9 @@ class SearxEngine(Engine):
             url = link.attributes.get("href", "") or ""
             title = text_of(link)
             snippet = text_of(art.css_first("p.content"))
-            if not url or not title:
+            if not url or not title or url in seen:
                 continue
+            seen.add(url)
             result = SearchResult(
                 title=title, url=url, snippet=snippet, engine=self.name, rank=0
             )

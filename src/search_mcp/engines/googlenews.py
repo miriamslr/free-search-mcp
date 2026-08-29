@@ -84,6 +84,7 @@ class GoogleNewsEngine(Engine):
     """Google News RSS — independent news index, no API key, structured dates."""
 
     name = "googlenews"
+    description = "Google News RSS: headlines with exact publish dates, edition-scoped by region."
     needs_browser = False  # plain RSS over HTTP, no JS
     # RSS feed: an empty/malformed parse is genuinely empty, so don't waste a
     # Playwright render trying to "recover" it (see Engine.search fallback).

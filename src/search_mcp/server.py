@@ -19,17 +19,21 @@ from .cache import cache
 from .compare import compare_urls
 from .config import settings
 from .documents import read_document
-from .engines import Category
+from .engines import ENGINES, Category, source_taxonomy
 from .fetcher import decode_cached_title, fetch_bytes, fetch_many, fetch_page
 from .formatting import (
     errors_to_hint,
     render_compare,
     render_doc,
+    render_engines,
     render_fetch,
+    render_paper_graph,
     render_research,
     render_search,
     render_structured,
 )
+from .keystore import PROVIDERS
+from .paper_graph import paper_graph as run_paper_graph
 from .research import research as run_research
 from .structured import extract_structured as _extract_structured
 
@@ -189,24 +193,30 @@ async def search(
     - Getting a list of URLs you can hand to `fetch` / `fetch_batch` next.
     - Topics likely to be after your knowledge cutoff (use `freshness="week"`).
     - Filtering to specific domains (`include_domains=["python.org"]`) or
-      content types (`category="paper"|"pdf"|"github"|"news"|"forum"|"blog"`).
+      a kind of source (`category="paper"` / `"finance"`, or a sub-group like
+      `category="paper.biomed"` / `"finance.filings"` — see `engines()` for the
+      full tree).
 
     Not recommended for:
     - You already know the URL -> use `fetch` instead.
     - You want both links AND their full text in one call -> use `research`.
     - You want to query pages already in the local cache -> use `cache_search`.
     - Reading PDFs/DOCX from a known URL -> use `read_doc`.
+    - Following one paper's references or citations -> use `paper_graph`.
 
     Returns:
     - markdown (default): numbered list of `n. title`, `<url>`, snippet — ~40%
       fewer tokens than json.
     - json: dict with `results` (list of {title,url,snippet,engines,score}),
       `engines`, `cached`, optional `errors` map, optional `hint` string.
+      `engines` is what was REQUESTED; each result's own `engines` is what
+      actually found it, and those differ whenever the rescue pass substitutes
+      a source (see `rescued_via`).
 
     Common mistakes:
     - Passing a URL as `query` — that's `fetch`'s job.
-    - Cranking `max_results` to 50 hoping for better recall; engines cap around
-      10-20 each, anything beyond is duplicate noise.
+    - Cranking `max_results` up hoping for better recall; engines cap around
+      10-20 each, anything beyond is duplicate noise (and 50 is the ceiling).
     - Adding `engines=["startpage","brave","bing","baidu"]` by default — those
       need browser rendering or captcha-friendly conditions; stick with the
       defaults unless they returned 0. If the defaults DO return 0, the keyless
@@ -219,7 +229,10 @@ async def search(
         query: Natural-language query (the same string a human would type).
         engines: Subset of `engines()`. None = duckduckgo+mojeek+googlenews+bing.
             (startpage is opt-in and browser-rendered.)
-        max_results: Merged result count after dedup. 5-20 is the useful range.
+        max_results: Merged result count after dedup, clamped to 1-50. It is
+            also the PER-ENGINE budget, so it multiplies across the fan-out;
+            5-20 is the useful range and anything past that is duplicate noise
+            bought with real latency. Omit it for the configured default.
         use_cache: Reuse the last result for this exact (query, engines,
             max_results, AND all active filters — freshness, include/exclude
             domains, category, include/exclude text) within the cache TTL.
@@ -236,13 +249,18 @@ async def search(
             it as a strong hint, not a hard filter; googlenews dates are exact.
         include_domains: List of domains to restrict to (e.g. ["python.org"]).
         exclude_domains: List of domains to exclude.
-        category: "news"|"pdf"|"github"|"paper"|"forum"|"blog" — content-type
-            shortcut. "paper" => arxiv/acm/springer/ieee/etc; "forum" =>
-            reddit/HN/stackexchange; "github" => code forges (github/gitlab/
-            codeberg/bitbucket/sourceforge/...). "news" keeps only ~33 major
-            outlets (client-side whitelist), so most DDG/Mojeek hits are dropped
-            — pair it with the default engines (googlenews is auto-added) and
-            note googlenews URLs resolve to the publisher on fetch/research.
+        category: Which KIND of source to search — the enum lists every value.
+            A bare group widens: "paper" adds one specialist per sub-group to the
+            default web pool. A dotted sub-group narrows to just the sources that
+            index it ("paper.biomed" => the biomedical indexes only). It also
+            RERANKS: engines that natively index the category count double in
+            the fusion, so the filing outranks the commentary about it. Call
+            `engines()` for the group -> sub-group -> engine tree with a line on
+            each source. Two behaviours worth knowing: "image"/"dataset" REPLACE
+            the web pool rather than augment it (a web engine cannot return an
+            image file), and "news"/"paper"/"forum"/"github"/"blog" also filter
+            general-web hits by hostname, so a strict category can thin those
+            engines out — the specialists it routes to are exempt.
         include_text: Substring required in title or snippet (case-insensitive).
         exclude_text: Substring forbidden in title or snippet.
         format: "markdown" (default) or "json".
@@ -348,18 +366,20 @@ async def fetch(
             text resources.
         format: "markdown" or "json".
     """
-    effective_force = force_refresh
-    if max_age_hours is not None:
-        if max_age_hours == 0:
-            effective_force = True
-        else:
-            cached = await cache.get_page(
-                url, max_age_seconds=_max_age_to_seconds(max_age_hours),
-            )
-            if cached is None:
-                effective_force = True
+    # max_age_hours=0 means "force refresh"; anything else just tightens the
+    # cache-read TTL, which fetch_page applies against the RESOLVED url.
+    effective_force = force_refresh or max_age_hours == 0
+    max_age_seconds = (
+        _max_age_to_seconds(max_age_hours)
+        if max_age_hours is not None and max_age_hours > 0
+        else None
+    )
     result = await fetch_page(
-        url, render=render, force_refresh=effective_force, inline=inline,
+        url,
+        render=render,
+        force_refresh=effective_force,
+        inline=inline,
+        max_age_seconds=max_age_seconds,
     )
     if result.data is not None and result.media_type.startswith("image/"):
         # Hand back real MCP image content rather than base64 in a string —
@@ -410,7 +430,13 @@ async def fetch_batch(
         format: "markdown" or "json".
     """
     if not urls:
-        return "" if format == "markdown" else []
+        # An empty string reads as "all of them failed silently". Say which of
+        # the two it is, in the same voice as the >20 branch below.
+        return (
+            "_No URLs given. Pass 1-20 absolute http(s) URLs._\n"
+            if format == "markdown"
+            else []
+        )
     if len(urls) > 20:
         raise ValueError(
             f"fetch_batch accepts at most 20 URLs per call (got {len(urls)}); "
@@ -502,6 +528,12 @@ async def read_doc(
     # do NOT duplicate that logic here (it would risk diverging behavior).
     if start < 0:
         raise ValueError(f"start must be >= 0, got {start}")
+    # A blank source is a caller mistake. Passed through, it fell to the
+    # local-file branch and came back as "Local file reads are disabled; set
+    # SEARCH_MCP_DOCUMENT_ROOT" — an answer to a question nobody asked, and one
+    # that sends the caller to configure a sandbox they do not need.
+    if not source.strip():
+        raise ValueError("source must not be empty: pass an http(s) URL or a file path")
     result = await read_document(source, start=start, length=length)
     payload = result.to_dict()
     return _maybe_render(payload, format, render_doc)
@@ -543,6 +575,7 @@ async def research(
     - You only need links -> `search` (cheaper, no fetching).
     - You only need to read one URL you already have -> `fetch`.
     - You want to query previously-fetched cached pages -> `cache_search`.
+    - Checking or expanding one paper's citations -> `paper_graph`.
 
     Returns:
     - markdown (default): a "Research brief" with a Sources index then the
@@ -561,8 +594,17 @@ async def research(
     Args:
         question: What you want to know, in natural language.
         depth: How many top results to fetch (1-8). 3 is a good default.
-        engines: Override the engine set (see `engines()` for names).
+        engines: Override the engine set (see `engines()` for names). Prefer
+            `category=` — naming engines turns category routing off.
         fetch: If False, return source list without reading them.
+        freshness: "day"|"week"|"month"|"year" — restrict to recent results.
+            Best-effort; undated results are kept rather than dropped.
+        include_domains: Restrict to these domains (e.g. ["python.org"]).
+        exclude_domains: Drop results from these domains.
+        category: Which KIND of source to search; a bare group widens, a dotted
+            sub-group narrows. Same values as `search` — see `engines()`.
+        include_text: Substring required in title or snippet (case-insensitive).
+        exclude_text: Substring forbidden in title or snippet.
         use_cache: Reuse cached search/page data within TTL.
         max_age_hours: Treat cached search results AND cached page bodies older
             than this as a read miss; fresh data is always written back. 0 =
@@ -604,6 +646,66 @@ async def research(
     await _safe_progress(ctx, 1.0, 1.0, "done")
 
     return _maybe_render(payload, format, render_research)
+
+
+@mcp.tool(
+    title="Walk a paper's citation graph",
+    annotations=ToolAnnotations(
+        read_only_hint=True,
+        idempotent_hint=True,
+        open_world_hint=True,
+    ),
+)
+async def paper_graph(
+    paper: str,
+    direction: Literal["both", "references", "citations"] = "both",
+    limit: int = 10,
+    format: Format = "markdown",
+) -> str | dict[str, Any]:
+    """Follow the citations of ONE paper, and check whether it still stands.
+
+    `search` finds papers that MENTION your words. This follows the edges
+    instead: what a specific paper built on, and what has built on it since.
+
+    Best for:
+    - Checking a citation before repeating it: is the DOI real, and has the
+      paper been retracted or corrected?
+    - "What happened after this result" — citing works come back ordered by how
+      much the field cited them, so a 2019 paper leads to the current state of
+      the art rather than to the most recent preprint about it.
+    - Building a reading list backwards from one good paper.
+
+    Not recommended for:
+    - Finding papers by topic -> `search(category="paper")`, or a sub-group
+      like `"paper.biomed"` / `"paper.cs"` / `"paper.preprint"`.
+    - Reading the paper itself -> `read_doc` on the returned URL.
+
+    Returns:
+    - markdown (default): the paper with its retraction/correction notices,
+      then "References" and "Cited by" sections.
+    - json: {paper, references, citations, notes}, where `paper.crossref`
+      carries `registered` and every post-publication `notices` entry.
+
+    Common mistakes:
+    - Passing a topic instead of a paper. A title resolves to its single best
+      match; a phrase that names no specific paper resolves to the wrong one.
+    - Reading an empty `citations` list as "uncited" when `notes` says the
+      lookup was truncated.
+
+    Args:
+        paper: DOI (`10.1145/1571941.1572114`, or a doi.org URL), an OpenAlex
+            ID (`W2148972377`), or the paper's exact title.
+        direction: "both", "references" (what it cites) or "citations" (what
+            cites it).
+        limit: Max neighbours per direction, 1-50.
+        format: "markdown" or "json".
+    """
+    if not paper.strip():
+        raise ValueError(
+            "paper must not be empty: pass a DOI, an OpenAlex ID, or the exact title"
+        )
+    payload = await run_paper_graph(paper, direction=direction, limit=limit)
+    return _maybe_render(payload, format, render_paper_graph)
 
 
 @mcp.tool(
@@ -652,6 +754,12 @@ async def cache_search(
     """
     # The cache stores metadata packed behind a sentinel in the title column,
     # so raw rows would hand the caller "\x01META\x01{...}" as a page title.
+    if not query.strip():
+        # Distinct from "the cache has nothing": telling a caller to populate a
+        # cache that may already be full sends them to fix the wrong thing.
+        if format == "json":
+            return []
+        return "_Empty query. Pass FTS5 terms, e.g. `asyncio` or `\"exact phrase\"`._\n"
     rows = [decode_cached_title(r) for r in await cache.search_pages(query, limit=limit)]
     if format == "json":
         return rows
@@ -685,53 +793,53 @@ async def cache_search(
         open_world_hint=False,
     ),
 )
-def engines() -> list[str]:
-    """List engine names accepted by the `engines=` parameter of `search` / `research`.
+def engines(
+    group: str | None = None,
+    format: Format = "markdown",
+) -> str | dict[str, Any]:
+    """List the available sources, grouped by what they index.
 
     Best for:
-    - Discovering what's installable before passing a non-default engine.
-    - Building user-facing UIs that let humans pick engines.
+    - Choosing a source deliberately: which one indexes filings, or preprints,
+      or Chinese-language pages.
+    - Checking a name before passing it to `engines=` on `search` / `research`.
 
     Not recommended for:
-    - Calling on every search — the list is static; cache it.
+    - Calling on every search — the list is static; read it once.
 
-    Returns:
-    - The live, complete list of engine name strings. The buckets below are
-      illustrative; always trust the returned list over this doc.
+    Returns (markdown): a `group -> sub-group -> engine` tree, one line of
+    description per engine. `group="paper"` restricts it to that group.
+    Returns (json): `{"engines": [...names...], "taxonomy": {...},
+    "descriptions": {...}}`.
+
+    Prefer `category=` over `engines=`. `category="paper"` WIDENS — it routes to
+    one specialist per sub-group. A dotted sub-group NARROWS: `"paper.biomed"`
+    queries only the biomedical indexes. Naming engines explicitly turns that
+    routing off entirely, so reach for it only to force a specific source.
 
     Common mistakes:
-    - Passing one of these names as a query to `search` — they go in the
-      `engines=` argument, not `query`.
-    - Passing a key-only engine (brave_api/serper/tavily/google_cse) with no key
-      configured — it returns an actionable error, not results.
-
-    Defaults: duckduckgo + mojeek + googlenews + bing (reliable, all-HTTP,
-              low-latency; googlenews is an RSS index with structured publish
-              dates and its URLs resolve to the real publisher on
-              fetch/research; bing's www4 edge answers in ~0.3s).
-    Keyless opt-in: google + serpsearch (Google SERP scrapers, HTTP-first),
-              anysearch (JSON aggregator), startpage (browser-rendered, slower),
-              brave (PoW captcha after a few calls), baidu
-              (CN index), bilibili (CN video), zhihu (CN Q&A, often login-gated),
-              sogou + so360 (CN indexes; sogou returns redirect URLs),
-              wikipedia (encyclopedia, follows SEARCH_MCP_REGION language),
-              openlibrary (books),
-              searx (public-instance meta-search; set SEARCH_MCP_SEARX_INSTANCES
-              if it returns nothing).
-    Vertical (auto-selected by `category`, see below): arxiv, openalex,
-              crossref, pubmed (papers); github, stackexchange, hackernews
-              (code and developer discussion); gdelt (worldwide news).
-    Key-required (configure via admin UI / SEARCH_MCP_*_API_KEY): brave_api,
-              serper, tavily, google_cse, github_code (GitHub rejects anonymous
-              code search).
-
-    You usually do NOT need to pass `engines=` for these. Passing `category=`
-    to `search`/`research` routes the query to the sources that natively index
-    it — `category="paper"` actually queries arXiv/OpenAlex/Crossref instead of
-    filtering general web results by hostname. Naming engines explicitly turns
-    that routing off.
+    - Passing one of these names as `query` — they belong in `engines=`.
+    - Passing a key-only engine with no key configured; it returns an
+      actionable error, not results.
     """
-    return list_engines()
+    taxonomy = source_taxonomy()
+    if group:
+        key = group.split(".", 1)[0].strip().lower()
+        taxonomy = {key: taxonomy[key]} if key in taxonomy else {}
+    names = [n for subs in taxonomy.values() for names_ in subs.values() for n in names_]
+    descriptions = {n: ENGINES[n].description for n in dict.fromkeys(names)}
+    # A provider marked `optional` works keyless (anysearch, github); the rest
+    # cannot run at all without a key. Derived from the keystore registry the
+    # admin UI already drives, so the two can never disagree.
+    needs_key = {p.engine for p in PROVIDERS if not p.optional}
+    if format == "json":
+        return {
+            "engines": list_engines() if not group else list(descriptions),
+            "taxonomy": taxonomy,
+            "descriptions": descriptions,
+            "needs_api_key": sorted(needs_key & set(descriptions)),
+        }
+    return render_engines(taxonomy, descriptions, needs_key)
 
 
 @mcp.tool(
@@ -1019,9 +1127,13 @@ async def cached_search(query_hash: str) -> str:
     `search_cache` table. Useful for exposing prior `search` invocations
     as MCP resources without re-running them.
     """
-    rows = await cache.get_search(query_hash)
-    if rows is None:
+    hit = await cache.get_search(query_hash)
+    if hit is None:
         raise ResourceNotFoundError(f"No cached search for hash: {query_hash}")
+    # get_search also returns the provenance recorded with the row; this
+    # resource is defined as the merged RESULT LIST, so only that half is
+    # serialised. Changing the shape here would break every existing reader.
+    rows, _meta = hit
     import json
     return json.dumps(rows, ensure_ascii=False, indent=2)
 

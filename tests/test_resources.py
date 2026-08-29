@@ -55,6 +55,8 @@ async def test_cached_search_resource_returns_json(isolated_cache):
     items = list(contents)
     body = "".join(getattr(c, "content", "") or "" for c in items)
     parsed = json.loads(body)
+    # The resource is defined as the merged RESULT LIST; get_search also hands
+    # back the provenance stored with the row, which this resource drops.
     assert parsed == rows
 
 

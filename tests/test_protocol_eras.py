@@ -44,6 +44,7 @@ async def test_tools_are_identical_across_protocol_eras(mode):
             "fetch_batch",
             "read_doc",
             "research",
+            "paper_graph",
             "cache_search",
             "engines",
             "compare",
@@ -60,8 +61,10 @@ async def test_engines_tool_callable_on_both_eras(mode):
     from search_mcp.engines import ENGINES
 
     async with Client(mcp, mode=mode) as client:
-        result = await client.call_tool("engines", {})
-        assert result.structured_content == {"result": list(ENGINES)}
+        result = await client.call_tool("engines", {"format": "json"})
+        payload = result.structured_content
+        payload = payload["result"] if set(payload) == {"result"} else payload
+        assert payload["engines"] == list(ENGINES)
 
 
 # ---------------------------------------------------------------------------

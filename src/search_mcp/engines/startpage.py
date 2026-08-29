@@ -23,6 +23,9 @@ _STARTPAGE_FRESHNESS = {"day": "d", "week": "w", "month": "m", "year": "y"}
 
 class StartpageEngine(Engine):
     name = "startpage"
+    description = (
+        "Google results without Google's tracking; needs a browser render, so it is slower."
+    )
     needs_browser = True
     wait_selector = ".result a[aria-label='link']"
 

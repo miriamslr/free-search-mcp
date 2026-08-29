@@ -66,6 +66,7 @@ class SerperEngine(Engine):
     """Serper (serper.dev) Google SERP — keyed, JSON POST."""
 
     name = "serper"
+    description = "Serper — Google results through a hosted API."
     needs_browser = False
     # JSON API: an empty/malformed response is genuinely empty, so don't waste
     # a Playwright render trying to "recover" it (see Engine.search fallback).

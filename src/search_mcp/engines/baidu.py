@@ -17,6 +17,7 @@ from .base import (
 
 class BaiduEngine(Engine):
     name = "baidu"
+    description = "百度 — the largest Chinese-language web index."
     needs_browser = False
 
     def build_url(
@@ -45,6 +46,11 @@ class BaiduEngine(Engine):
     def parse(self, html: str) -> list[SearchResult]:
         tree = parse_html(html)
         results: list[SearchResult] = []
+        seen: set[str] = set()
+        # Guard against a SERP repeating a URL (and against a future markup
+        # change re-introducing a double match): a duplicate inside one bucket
+        # scores twice in the aggregator's RRF merge, inflating this engine's
+        # weight, and eats a slot in the max_results budget.
         for div in tree.css("div.result.c-container, div.result-op.c-container"):
             link = div.css_first("h3.t a") or div.css_first("h3 a")
             if not link:
@@ -61,8 +67,9 @@ class BaiduEngine(Engine):
                 or div.css_first('[class*="content-right"]')
                 or div.css_first('[class*="abstract"]')
             )
-            if not url or not title:
+            if not url or not title or url in seen:
                 continue
+            seen.add(url)
             result = SearchResult(title=title, url=url, snippet=snippet, engine=self.name, rank=0)
             hint = extract_date_hint(snippet) or extract_date_hint(title)
             if hint:

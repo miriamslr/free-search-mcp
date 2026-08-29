@@ -14,7 +14,15 @@ from rapidfuzz import fuzz
 from .browser import BROWSER_INSTALL_HINT
 from .cache import cache
 from .config import settings
-from .engines import ENGINES, Category, Engine, SearchFilters, SearchResult, get_engine
+from .engines import (
+    ENGINES,
+    Category,
+    Engine,
+    SearchFilters,
+    SearchResult,
+    category_group,
+    get_engine,
+)
 from .ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
@@ -43,6 +51,23 @@ def _max_token_wait(engine: Any) -> float | None:
 _EXCLUSIVE_CATEGORIES = frozenset({"image", "dataset"})
 
 
+def _is_exclusive(category: str | None) -> bool:
+    """Whether `category`'s specialists replace the default web pool.
+
+    Checks the FULL token before the group, so exclusivity can later be
+    declared per sub-group (an `image.*` sub-group that should augment) without
+    reopening this. A plain `category in _EXCLUSIVE_CATEGORIES` test silently
+    dropped every dotted image/dataset token back into the augmenting branch,
+    re-admitting the four web engines that exclusivity exists to keep out.
+    """
+    if not category:
+        return False
+    return (
+        category in _EXCLUSIVE_CATEGORIES
+        or category_group(category) in _EXCLUSIVE_CATEGORIES
+    )
+
+
 def engines_for_category(
     category: str | None, exclude: list[str] | None = None
 ) -> list[str]:
@@ -67,6 +92,8 @@ def engines_for_category(
         and name not in already
         and engine.is_available()
     ]
+    if "." not in category:
+        picks = _round_robin_by_subgroup(category, picks)
     limit = settings.category_engine_limit
     if limit >= 0:
         dropped = picks[limit:]
@@ -75,10 +102,48 @@ def engines_for_category(
             # Say so rather than silently truncating — an operator wondering
             # why arxiv never runs needs this in the log, not in the source.
             log.info(
-                "category %r: using %s, over category_engine_limit=%d (skipped %s)",
+                "category %r: using %s, over category_engine_limit=%d (skipped %s; "
+                "name one explicitly with engines=[...] or ask for its sub-group)",
                 category, picks, limit, dropped,
             )
     return picks
+
+
+def _round_robin_by_subgroup(group: str, names: list[str]) -> list[str]:
+    """Interleave a group's engines across its sub-groups before the cap bites.
+
+    Registry order alone spends the whole `category_engine_limit` budget on
+    whichever sub-group happens to sit first. `category="paper"` was the worked
+    example: registry order gave `arxiv, openalex, crossref` and dropped
+    `pubmed` entirely — while two of the three slots went to OpenAlex and
+    Crossref, both DOI indexes with heavy overlap. Interleaving spends the same
+    three round trips on three genuinely different corpora (a preprint server,
+    a works index, a biomedical index) and, as a side effect, un-kills the
+    engine four separate docs had been advertising for a category it could
+    never run in.
+
+    Only applies to a BARE group: a caller who asked for `paper.biomed` wants
+    that sub-group's engines in registry order, not a spread.
+
+    An engine that serves several sub-groups is bucketed under its
+    alphabetically first one, so it is counted exactly once and the result stays
+    deterministic.
+    """
+    prefix = group + "."
+    buckets: dict[str, list[str]] = {}
+    for name in names:
+        subs = sorted(
+            token[len(prefix):]
+            for token in ENGINES[name].categories
+            if token.startswith(prefix)
+        )
+        buckets.setdefault(subs[0] if subs else "", []).append(name)
+    ordered: list[str] = []
+    while any(buckets.values()):
+        for bucket in buckets.values():
+            if bucket:
+                ordered.append(bucket.pop(0))
+    return ordered
 
 
 def _normalize_url(url: str) -> str:
@@ -318,7 +383,10 @@ def _gate_hint(gated: dict[str, str], fallback: dict[str, str]) -> str:
 
 
 def _needs_rescue(
-    merged: list[dict[str, Any]], errors: dict[str, str], diagnostics: dict[str, Any]
+    merged: list[dict[str, Any]],
+    errors: dict[str, str],
+    diagnostics: dict[str, Any],
+    category: str | None = None,
 ) -> bool:
     """Decide whether the keyless rescue pass should run.
 
@@ -328,8 +396,18 @@ def _needs_rescue(
     demonstrably unhealthy: an engine errored, hit a gate, or silently
     returned zero. A healthy niche query that legitimately yields a few
     results must NOT trigger network work — the normal-path latency guarantee.
+
+    NEVER for an exclusive category. `settings.rescue_engines` is the general
+    web pool, and the whole reason `image` and `dataset` REPLACE that pool is
+    that a web engine cannot return an image file or a dataset record. Rescuing
+    into it hands back exactly the wrong media type — HTML pages that
+    `fetch(inline=True)` cannot render — under a header saying the search
+    succeeded. Reporting the empty run is the honest answer, and the sparse and
+    empty-engine hints already do that.
     """
     if not settings.rescue_enabled:
+        return False
+    if _is_exclusive(category):
         return False
     if len(merged) == 0:
         return True
@@ -422,10 +500,106 @@ def _key(query: str, engines: list[str], max_results: int, filters: SearchFilter
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _merge(buckets: list[list[SearchResult]], max_results: int) -> list[dict[str, Any]]:
-    """Reciprocal-rank-fusion across engines: same URL appearing high in multiple
-    engines wins. Stable, no scoring magic, well-known IR technique."""
-    k = 60.0
+def _absorb(rec: dict[str, Any], r: SearchResult) -> None:
+    """Fold another sighting of the same URL into its representative record.
+
+    FIELD-wise, not record-wise. The best value for each field lives in a
+    different bucket, and picking one record wholesale — the one with the
+    longest snippet — threw the others away. Concretely: googlenews, gdelt,
+    arxiv and crossref supply an exact `published_age` from a structured
+    source, an HTML scraper supplies a longer snippet, the scraper won the
+    whole record, and the ranked-output loop below then dropped the
+    now-empty `published_age` from the payload entirely. That is the one
+    field `search`'s docstring tells the model to rely on for freshness.
+    """
+    if len(r.snippet) > len(rec.get("snippet") or ""):
+        rec["snippet"] = r.snippet
+    if not (rec.get("title") or "").strip() and r.title.strip():
+        rec["title"] = r.title
+    # A date from a structured source (RSS pubDate, an API field) beats one
+    # scraped out of snippet prose. Among equals, the first sighting wins.
+    confident = _is_confident(r)
+    if r.published_age and (
+        not rec.get("published_age")
+        or (confident and not rec.get(_AGE_CONFIDENT))
+    ):
+        rec["published_age"] = r.published_age
+        rec[_AGE_CONFIDENT] = confident
+
+
+# Internal-only marker carried on the representative dict while merging, so
+# `_absorb` can prefer a trusted date over a scraped one. `to_dict()`
+# deliberately omits `published_age_confident`, and it must not reach output.
+_AGE_CONFIDENT = "_published_age_confident"
+
+
+def _is_confident(r: Any) -> bool:
+    """Whether this result's `published_age` came from a structured source.
+
+    getattr, not attribute access: tests substitute duck-typed result stubs
+    that predate the flag, and a missing attribute means "not known to be
+    trusted" — the same convention `_max_token_wait` uses for engine stubs.
+    """
+    return bool(getattr(r, "published_age_confident", False))
+
+
+# RRF's damping constant, from Cormack et al. 2009. Measured on a 14-query set
+# against real engine output: moving it anywhere between 5 and 60 changed MRR
+# by under 0.01, because ranks are already correlated across engines. Left at
+# the literature value — there is no evidence here for a different one.
+_RRF_K = 60.0
+
+# How much a result from an engine that NATIVELY indexes the requested category
+# counts, relative to a general web engine.
+#
+# Without this, `category=` barely affected the ORDER of results. A specialist
+# is usually the only source returning a given document, so its hit scored
+# 1/61 while three general engines agreeing on a blog post about the topic
+# scored 3/61 and won: `category="finance.filings"` put NVIDIA's actual 10-K
+# fourth, behind commentary about it. Measured (hit@1 / hit@3 / MRR against the
+# one result a knowledgeable person would call correct, 14 queries):
+#
+#     weight 1.0 (before)   6/14   9/14   0.605
+#     weight 2.0            8/14  13/14   0.747    6 improved, 0 regressed
+#
+# 2.0 is the point where one native hit ties two general engines agreeing — a
+# rule that can be stated, rather than a constant fitted to this set. Higher
+# values nudged MRR up but cost hit@3, and by 3.0 they let ANY native result
+# outrank a consensus one: the correct arXiv URL for "attention is all you
+# need" fell from rank 1 to rank 18, behind other papers arXiv returned first.
+_NATIVE_CATEGORY_WEIGHT = 2.0
+
+
+def _native_engines(category: str | None) -> frozenset[str]:
+    """Names of the engines that declare `category`.
+
+    Accepts either level of the token: an engine declaring `paper.biomed` also
+    declares `paper`, so both resolve here without the caller splitting
+    anything — the same test `engines_for_category` uses.
+    """
+    if not category:
+        return frozenset()
+    return frozenset(
+        name for name, engine in ENGINES.items() if category in engine.categories
+    )
+
+
+def _merge(
+    buckets: list[list[SearchResult]],
+    max_results: int,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    """Weighted reciprocal-rank fusion across engines.
+
+    A URL appearing high in several engines wins, except that when the caller
+    named a `category`, the engines that natively index it count double (see
+    `_NATIVE_CATEGORY_WEIGHT`). Still no per-result scoring magic: a lexical
+    query/title overlap bonus was tried on the same measurement set and made
+    every configuration worse (MRR 0.747 -> 0.645), so rank and engine
+    agreement remain the only signals.
+    """
+    k = _RRF_K
+    native = _native_engines(category)
     scores: dict[str, float] = {}
     representative: dict[str, dict[str, Any]] = {}
     engines_for: dict[str, list[str]] = {}
@@ -435,13 +609,17 @@ def _merge(buckets: list[list[SearchResult]], max_results: int) -> list[dict[str
             url = _normalize_url(r.url)
             if not url:
                 continue
-            scores[url] = scores.get(url, 0.0) + 1.0 / (k + r.rank)
+            weight = _NATIVE_CATEGORY_WEIGHT if r.engine in native else 1.0
+            scores[url] = scores.get(url, 0.0) + weight / (k + r.rank)
             engines_for.setdefault(url, []).append(r.engine)
-            if url not in representative or len(r.snippet) > len(
-                representative[url].get("snippet", "")
-            ):
-                representative[url] = r.to_dict()
-                representative[url]["url"] = url
+            rec = representative.get(url)
+            if rec is None:
+                rec = r.to_dict()
+                rec["url"] = url
+                rec[_AGE_CONFIDENT] = _is_confident(r)
+                representative[url] = rec
+            else:
+                _absorb(rec, r)
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     out_full = []
@@ -451,6 +629,7 @@ def _merge(buckets: list[list[SearchResult]], max_results: int) -> list[dict[str
         rec["score"] = round(score, 5)
         rec.pop("rank", None)
         rec.pop("engine", None)
+        rec.pop(_AGE_CONFIDENT, None)
         # `published_age` (when present) flows through automatically via
         # SearchResult.to_dict(); we drop the empty-string default so the
         # field is absent from output rather than noisy.
@@ -463,6 +642,12 @@ def _merge(buckets: list[list[SearchResult]], max_results: int) -> list[dict[str
     # the top-N is backfilled by the next unique result instead of leaving the
     # caller short of max_results (#7).
     return _dedup_by_title(out_full)[:max_results]
+
+
+# Upper bound on `max_results`. Engines cap out around 10-20 results each, so
+# anything past this is duplicate noise bought with real latency — and the
+# number is also the per-engine budget, so it multiplies across the fan-out.
+_MAX_RESULTS = 50
 
 
 async def aggregate_search(
@@ -481,7 +666,7 @@ async def aggregate_search(
 ) -> dict[str, Any]:
     if engines:
         engine_names = list(engines)
-    elif category in _EXCLUSIVE_CATEGORIES:
+    elif _is_exclusive(category):
         # For these, the general web pool is noise rather than coverage: a web
         # engine cannot return an image file or a dataset record, so mixing it
         # in only crowds out the sources that can. Falls back to the default
@@ -490,12 +675,29 @@ async def aggregate_search(
     else:
         engine_names = list(settings.default_engines)
         engine_names.extend(engines_for_category(category, exclude=engine_names))
-    n = max_results or settings.max_results_per_engine
+    # `or` would have turned an explicit 0 into the default — a caller who
+    # asked for nothing got ten results and no indication anything was ignored.
+    # `None` still means "use the configured default"; a number is clamped into
+    # a range the fan-out can actually honour, since every engine is queried
+    # for `n` and a four-figure request buys duplicate noise, not recall.
+    n = (
+        settings.max_results_per_engine
+        if max_results is None
+        else max(1, min(int(max_results), _MAX_RESULTS))
+    )
+    # ONE place normalizes the category token, and it is here. Routing above
+    # uses the caller's raw token (so `paper.biomed` reaches only the engines
+    # that declare it), while everything downstream — the post-filter branches,
+    # `finalize_results`, and the eleven engines that special-case
+    # `category == "pdf"` — only ever sees a bare group. Splitting inside the
+    # post-filter instead would have made "category may be dotted" an invariant
+    # that exactly one file honoured.
     filters = SearchFilters(
         freshness=freshness,
         include_domains=list(include_domains) if include_domains else [],
         exclude_domains=list(exclude_domains) if exclude_domains else [],
-        category=category,
+        category=category_group(category),
+        category_token=category,
         include_text=include_text,
         exclude_text=exclude_text,
     )
@@ -509,19 +711,32 @@ async def aggregate_search(
     #   max_age_seconds == 0     -> always a read miss (force-refresh).
     #   max_age_seconds > 0      -> read only if the row is younger than that.
     if use_cache and max_age_seconds != 0:
-        hit = await cache.get_search(cache_key, max_age_seconds=max_age_seconds)
-        if hit:
+        cached = await cache.get_search(cache_key, max_age_seconds=max_age_seconds)
+        if cached:
+            hit, meta = cached
             # A4: recompute lead_snippet from the cached results so the rendered
             # markdown keeps its '> **Lead:**' block. filter_diagnostics can't be
             # rebuilt from results alone (it needs the per-engine raw/drop tallies
             # that only exist on a fresh run), so it is intentionally fresh-only.
-            return {
+            payload = {
                 "query": query,
                 "engines": engine_names,
                 "cached": True,
                 "results": hit,
                 "lead_snippet": _lead_snippet(query, hit),
             }
+            # Provenance, unlike run statistics, describes the RESULTS — and the
+            # results are exactly what we just replayed. A set that only exists
+            # because a captcha-walled engine was rescued via searx has to say so
+            # every time it is served, or the second identical query inside the
+            # 7-day TTL silently re-labels a recovered set as a normal one.
+            gated = meta.get("gated_engines")
+            if gated:
+                payload["gated_engines"] = gated
+                payload["gated_hint"] = meta.get("gated_hint") or ""
+            if meta.get("rescued_via"):
+                payload["rescued_via"] = meta["rescued_via"]
+            return payload
 
     # Shared accumulator the engines populate with raw/filtered counts, per-reason
     # drop tallies, and gate/fallback signals. Always built (cheap dict writes) so
@@ -555,7 +770,7 @@ async def aggregate_search(
         else:
             buckets.append(res)
 
-    merged = _merge(buckets, n)
+    merged = _merge(buckets, n, category)
 
     # Keyless rescue: one bounded recovery attempt when the run came back
     # empty or nearly-empty with demonstrably unhealthy engines. Rescue
@@ -564,13 +779,13 @@ async def aggregate_search(
     # they flow into the cache write below like any other result — a repeat
     # query within TTL should not re-pay the rescue.
     rescued_via: str | None = None
-    if _needs_rescue(merged, errors, diagnostics):
+    if _needs_rescue(merged, errors, diagnostics, category):
         rescue_bucket, rescued_via = await _rescue(
             query, n, filters, engine_names, diagnostics
         )
         if rescue_bucket:
             buckets.append(rescue_bucket)
-            merged = _merge(buckets, n)
+            merged = _merge(buckets, n, category)
             # Attribute the recovery to the gated engines so the gate hint
             # reads "was captcha-gated → served via searx" instead of the
             # misleading "(no results)".
@@ -579,8 +794,24 @@ async def aggregate_search(
                 for name in diagnostics.get("gated", {}):
                     fb.setdefault(name, rescued_via)
 
+    # Gate/fallback provenance is computed BEFORE the cache write so it can be
+    # stored alongside the results it describes and replayed on a later hit.
+    gated = diagnostics.get("gated") or {}
+    fallback = diagnostics.get("fallback") or {}
+    gated_engines = {
+        name: {"reason": gated.get(name, "gated"), "fallback": fallback.get(name)}
+        for name in sorted(set(gated) | set(fallback))
+    }
+    gated_hint = _gate_hint(gated, fallback) if gated_engines else ""
+
     if use_cache and merged:
-        await cache.put_search(cache_key, query, engine_names, merged)
+        meta: dict[str, Any] = {}
+        if gated_engines:
+            meta["gated_engines"] = gated_engines
+            meta["gated_hint"] = gated_hint
+        if rescued_via:
+            meta["rescued_via"] = rescued_via
+        await cache.put_search(cache_key, query, engine_names, merged, meta or None)
 
     payload: dict[str, Any] = {
         "query": query,
@@ -592,6 +823,23 @@ async def aggregate_search(
     }
     if rescued_via:
         payload["rescued_via"] = rescued_via
+
+    # Engines the rate limiter refused a token to. Recorded since the limiter
+    # was added but never read, so a source silently vanished from a search it
+    # was listed in: `gdelt` (6/min, max_wait 1.0s) drops out of a second news
+    # query with no error, no `empty_engines` entry (it never reached
+    # `engine.search`, so it has no `raw_per_engine` row either) and no hint,
+    # while still appearing in `payload["engines"]`. Reported unconditionally —
+    # the key is absent unless an engine was actually skipped, and losing a
+    # source matters whether or not the remaining ones found plenty.
+    rate_limited = diagnostics.get("rate_limited") or []
+    if rate_limited:
+        payload["rate_limited_engines"] = sorted(rate_limited)
+        payload["rate_limited_hint"] = (
+            f"{', '.join(sorted(rate_limited))} did not run: no rate-limit token was "
+            "available within the wait this engine allows. This is throttling, not "
+            "an empty result — retry in a minute for that source's coverage."
+        )
 
     # Surface filter diagnostics ONLY when (a) the user actually set a filter,
     # AND (b) the final result set is sparse. Otherwise omit the field entirely
@@ -611,14 +859,9 @@ async def aggregate_search(
     # Surface gate/fallback signals (CAPTCHA / consent / login walls) so the
     # caller learns WHY an engine returned nothing — and whether a searx
     # fallback covered it — instead of seeing a silent gap.
-    gated = diagnostics.get("gated") or {}
-    fallback = diagnostics.get("fallback") or {}
-    if gated or fallback:
-        payload["gated_engines"] = {
-            name: {"reason": gated.get(name, "gated"), "fallback": fallback.get(name)}
-            for name in sorted(set(gated) | set(fallback))
-        }
-        payload["gated_hint"] = _gate_hint(gated, fallback)
+    if gated_engines:
+        payload["gated_engines"] = gated_engines
+        payload["gated_hint"] = gated_hint
 
     # Engines that returned 0 raw results with no exception and no detected
     # gate — the silent failure mode (IP block, markup drift) that otherwise

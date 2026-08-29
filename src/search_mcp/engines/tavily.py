@@ -82,6 +82,7 @@ class TavilyEngine(Engine):
     """Tavily AI-search REST API — keyed, JSON POST."""
 
     name = "tavily"
+    description = "Tavily — an LLM-oriented search API that returns cleaned page content."
     needs_browser = False
     # JSON API: an empty/malformed response is genuinely empty, so don't waste
     # a Playwright render trying to "recover" it (see Engine.search fallback).

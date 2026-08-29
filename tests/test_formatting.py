@@ -174,3 +174,23 @@ def test_render_research_lists_sources_and_documents():
     assert "## Sources" in md
     assert "## Documents" in md
     assert "Content body." in md
+
+
+def test_render_fetch_separates_the_metadata_block_from_the_body():
+    """`"\\n".join(header)` already ends the header with ONE newline, so
+    appending the content directly glued the page's first paragraph onto the
+    italic `_fetched via ..._` line. `render_doc` gets this right; every
+    `fetch`/`fetch_batch` markdown response got it wrong."""
+    from search_mcp.formatting import render_fetch
+
+    out = render_fetch(
+        {
+            "url": "https://example.com/a",
+            "title": "T",
+            "method": "http",
+            "tokens_estimated": 5,
+            "content": "First paragraph.\n\nSecond paragraph.",
+        }
+    )
+    assert "\n\nFirst paragraph." in out
+    assert "tokens\nFirst paragraph." not in out

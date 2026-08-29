@@ -22,7 +22,15 @@ from __future__ import annotations
 from urllib.parse import quote_plus, urljoin
 
 from ..config import settings
-from .base import Engine, SearchFilters, SearchResult, extract_date_hint, parse_html, text_of
+from .base import (
+    Engine,
+    SearchFilters,
+    SearchResult,
+    augment_query_with_operators,
+    extract_date_hint,
+    parse_html,
+    text_of,
+)
 
 _ORIGIN = "https://www.sogou.com"
 _ENDPOINT = f"{_ORIGIN}/web"
@@ -35,11 +43,25 @@ class SogouEngine(Engine):
     """搜狗 web results (keyless HTML scrape, redirect URLs)."""
 
     name = "sogou"
+    description = "搜狗 — second Chinese web index; emits Sogou redirect URLs rather than targets."
 
     def build_url(
         self, query: str, max_results: int, filters: SearchFilters | None = None
     ) -> str:
-        params = [f"query={quote_plus(query)}"]
+        filetype = "pdf" if filters and filters.category == "pdf" else None
+        # site:/-site:/filetype: are understood by both Chinese indexes, and
+        # they are the ONLY way these filters reach the engine — there are no
+        # dedicated URL parameters for them. Without this the engine returned
+        # unconstrained results that `apply_post_filters` then discarded
+        # wholesale, so an include_domains search came back empty and the
+        # sparse-result hint blamed the filter instead of the engine.
+        q = augment_query_with_operators(
+            query,
+            include_domains=filters.include_domains if filters else None,
+            exclude_domains=filters.exclude_domains if filters else None,
+            filetype=filetype,
+        )
+        params = [f"query={quote_plus(q)}"]
         if filters and filters.freshness:
             token = _FRESHNESS.get(filters.freshness)
             if token:

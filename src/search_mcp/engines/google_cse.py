@@ -74,6 +74,7 @@ class GoogleCSEEngine(Engine):
     """Google Custom Search JSON API — keyed (api_key + cx), JSON GET."""
 
     name = "google_cse"
+    description = "Google Programmable Search — official Google results via a custom search engine."
     needs_browser = False
     # JSON API: an empty/malformed response is genuinely empty, so don't waste
     # a Playwright render trying to "recover" it (see Engine.search fallback).

@@ -24,7 +24,9 @@ from urllib.parse import quote_plus
 from .base import SearchFilters, SearchResult
 from .jsonapi import JsonApiEngine, clip, iso_date
 
-_ENDPOINT = "http://export.arxiv.org/api/query"
+# https, not http: export.arxiv.org serves TLS, and every other endpoint in
+# this package is https. Plaintext bought a redirect hop and nothing else.
+_ENDPOINT = "https://export.arxiv.org/api/query"
 _NS = {"a": "http://www.w3.org/2005/Atom"}
 
 
@@ -32,7 +34,8 @@ class ArxivEngine(JsonApiEngine):
     """arXiv preprint search (keyless Atom API)."""
 
     name = "arxiv"
-    categories = frozenset({"paper"})
+    description = "arXiv preprints in physics, maths, CS and quantitative biology."
+    categories = frozenset({"paper", "paper.preprint"})
 
     def build_url(
         self, query: str, max_results: int, filters: SearchFilters | None = None

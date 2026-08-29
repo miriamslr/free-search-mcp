@@ -19,18 +19,42 @@ from .jsonapi import JsonApiEngine, clip
 
 _ENDPOINT = "https://api.openalex.org/works"
 
+# Ask only for the fields `map_results` actually renders. Without `select`
+# OpenAlex ships the FULL work record — authorships, concepts, referenced_works,
+# counts_by_year — and a 10-result page measured 174 KB against 56 KB with this
+# list. Crossref (`select=`) and Open Library (`fields=`) already do the same;
+# OpenAlex was the outlier.
+_SELECT = ",".join(
+    (
+        "id",
+        "doi",
+        "title",
+        "display_name",
+        "publication_date",
+        "cited_by_count",
+        "primary_location",
+        "abstract_inverted_index",
+    )
+)
+
+
+# Comfortably more words than SNIPPET_CAP (400 chars) can hold, so `clip()`
+# stays the thing that decides the snippet's length.
+_MAX_ABSTRACT_WORDS = 150
+
 
 class OpenAlexEngine(JsonApiEngine):
     """OpenAlex scholarly works search (keyless JSON API)."""
 
     name = "openalex"
-    categories = frozenset({"paper"})
+    description = "OpenAlex — 250M+ scholarly works with abstracts, venues and citation counts."
+    categories = frozenset({"paper", "paper.index"})
 
     def build_url(
         self, query: str, max_results: int, filters: SearchFilters | None = None
     ) -> str:
         n = max(1, min(max_results, 200))
-        params = [f"search={quote_plus(query)}", f"per-page={n}"]
+        params = [f"search={quote_plus(query)}", f"per-page={n}", f"select={_SELECT}"]
         if settings.contact_email:
             params.append(f"mailto={quote_plus(settings.contact_email)}")
         if filters and filters.freshness:
@@ -104,9 +128,11 @@ class OpenAlexEngine(JsonApiEngine):
     def _abstract_text(inverted: Any) -> str:
         """Rebuild prose from OpenAlex's `{word: [positions]}` inverted index.
 
-        Bounded on purpose: only the first `SNIPPET_CAP`-worth of positions
-        matter for a snippet, but the index itself can hold a whole abstract,
-        so the join happens once over a dict that is already in memory.
+        Bounded on purpose, and now actually bounded: the result is a SNIPPET,
+        so only the leading words can survive `clip()`. Joining the whole
+        abstract and then throwing 90% of it away was work done for nothing.
+        `_MAX_ABSTRACT_WORDS` is set well above the word count `SNIPPET_CAP`
+        chars can hold, so the clip — not this cap — is what decides the text.
         """
         if not isinstance(inverted, dict):
             return ""
@@ -119,4 +145,5 @@ class OpenAlexEngine(JsonApiEngine):
                     positions[i] = word
         if not positions:
             return ""
-        return " ".join(positions[i] for i in sorted(positions))
+        ordered = sorted(positions)[:_MAX_ABSTRACT_WORDS]
+        return " ".join(positions[i] for i in ordered)

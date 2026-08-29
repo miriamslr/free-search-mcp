@@ -124,6 +124,7 @@ class JsonApiEngine(Engine):
         *,
         method: str = "GET",
         json_body: Any | None = None,
+        form_body: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> str | None:
         """Return the response body, or None on any failure.
@@ -146,7 +147,14 @@ class JsonApiEngine(Engine):
                 **curl_proxy_kwargs(self.name),
             ) as client:
                 if method == "POST":
-                    resp = await client.post(url, json=json_body)
+                    # Not every JSON API takes a JSON request. cninfo's
+                    # announcement search is a classic form POST that answers
+                    # with JSON, so both body encodings are supported; `data`
+                    # wins when given, since sending both would be ambiguous.
+                    if form_body is not None:
+                        resp = await client.post(url, data=form_body)
+                    else:
+                        resp = await client.post(url, json=json_body)
                 else:
                     resp = await client.get(url)
                 if resp.status_code != 200:
@@ -164,6 +172,7 @@ class JsonApiEngine(Engine):
         *,
         method: str = "GET",
         json_body: Any | None = None,
+        form_body: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> Any | None:
         """Fetch and JSON-decode. None on transport failure or malformed JSON.
@@ -178,7 +187,11 @@ class JsonApiEngine(Engine):
 
         merged = {"Accept": "application/json", **(headers or {})}
         body = await self._request_text(
-            url, method=method, json_body=json_body, headers=merged
+            url,
+            method=method,
+            json_body=json_body,
+            form_body=form_body,
+            headers=merged,
         )
         if body is None:
             return None

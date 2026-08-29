@@ -18,6 +18,7 @@ _BRAVE_FRESHNESS = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}
 
 class BraveEngine(Engine):
     name = "brave"
+    description = "Brave's independent web index; serves a proof-of-work captcha after a few calls."
     needs_browser = True
     wait_selector = "#results, .snippet"
 
@@ -50,6 +51,13 @@ class BraveEngine(Engine):
     def parse(self, html: str) -> list[SearchResult]:
         tree = parse_html(html)
         results: list[SearchResult] = []
+        seen: set[str] = set()
+        # selectolax concatenates the match sets of a comma selector WITHOUT
+        # deduplicating, so every `.snippet[data-type="web"]` living inside
+        # `#results` matched both groups and was emitted twice: half the
+        # max_results budget went to duplicates, and the survivors scored twice
+        # in the RRF merge, giving Brave ~2x the weight of every other engine.
+        # Same defect duckduckgo.py documents for its old comma selector.
         for snip in tree.css('div.snippet[data-type="web"], #results .snippet'):
             link = snip.css_first("a")
             if not link:
@@ -66,8 +74,9 @@ class BraveEngine(Engine):
                 or snip.css_first(".snippet-content")
                 or snip.css_first(".snippet-content-summary")
             )
-            if not url or not title or url.startswith("#"):
+            if not url or not title or url.startswith("#") or url in seen:
                 continue
+            seen.add(url)
             result = SearchResult(title=title, url=url, snippet=snippet, engine=self.name, rank=0)
             hint = extract_date_hint(snippet) or extract_date_hint(title)
             if hint:

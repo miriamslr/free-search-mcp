@@ -397,3 +397,141 @@ def test_lead_snippet_picks_chinese_query_when_bigrams_match():
     assert out is not None
     assert "zhihu.com" in out
     assert "DeepSeek" in out
+
+
+# ---------------------------------------------------------------------------
+# _merge builds its representative FIELD-wise, not record-wise
+# ---------------------------------------------------------------------------
+
+
+def _hit(engine, rank, snippet, age="", confident=False, title="Same story"):
+    r = SearchResult(
+        title=title,
+        url="https://example.com/story",
+        snippet=snippet,
+        engine=engine,
+        rank=rank,
+    )
+    r.published_age = age
+    r.published_age_confident = confident
+    return r
+
+
+def test_merge_keeps_the_trusted_date_when_another_engine_has_a_longer_snippet():
+    """Picking one record wholesale — the one with the longest snippet — threw
+    away the only exact publication date in the set.
+
+    googlenews/gdelt/arxiv/crossref supply `published_age` from a structured
+    source; an HTML scraper supplies a longer snippet and no date. The scraper
+    won the whole record, and the ranked-output loop then dropped the
+    now-empty `published_age` from the payload entirely — losing the one field
+    `search`'s docstring tells the model to rely on for freshness.
+    """
+    structured = _hit("gdelt", 1, "short", age="2026-08-27", confident=True)
+    scraped = _hit("duckduckgo", 1, "a considerably longer snippet body here")
+
+    out = _merge([[structured], [scraped]], max_results=5)
+    assert len(out) == 1
+    assert out[0]["published_age"] == "2026-08-27"
+    assert out[0]["snippet"] == "a considerably longer snippet body here"
+
+
+def test_merge_prefers_a_structured_date_over_a_scraped_one():
+    """A relative phrase scraped out of snippet prose must not displace an
+    exact date an API actually asserted, whichever engine is seen first."""
+    scraped = _hit("duckduckgo", 1, "long snippet from the web page", age="3 days ago")
+    structured = _hit("googlenews", 2, "s", age="2026-08-27", confident=True)
+
+    out = _merge([[scraped], [structured]], max_results=5)
+    assert out[0]["published_age"] == "2026-08-27"
+
+
+def test_merge_never_leaks_the_internal_confidence_marker():
+    """`published_age_confident` is internal-only — `SearchResult.to_dict()`
+    drops it on purpose, and the merge marker must not put it back."""
+    out = _merge([[_hit("gdelt", 1, "s", age="2026-08-27", confident=True)]], 5)
+    assert not [k for k in out[0] if "confident" in k], out[0]
+
+
+# --- weighted RRF: category-native engines count double ---------------------
+
+
+def _res(engine, url, rank, title="T"):
+    from search_mcp.engines.base import SearchResult
+
+    r = SearchResult(title=title, url=url, snippet="", engine=engine, rank=rank)
+    return r
+
+
+def test_a_native_engine_hit_ties_two_general_engines_agreeing():
+    """The stated rule behind `_NATIVE_CATEGORY_WEIGHT = 2.0`. Without it a
+    specialist scored 1/61 — it is usually the ONLY source returning a given
+    document — while three general engines agreeing on a blog post about the
+    topic scored 3/61 and won."""
+    from search_mcp.aggregator import _merge
+
+    native = [[_res("arxiv", "https://arxiv.org/abs/1", 1)]]
+    consensus = [
+        [_res("duckduckgo", "https://blog.example/post", 1)],
+        [_res("bing", "https://blog.example/post", 1)],
+    ]
+    merged = _merge(native + consensus, 5, "paper")
+    scores = {r["url"]: r["score"] for r in merged}
+    assert scores["https://arxiv.org/abs/1"] == scores["https://blog.example/post"]
+
+
+def test_a_native_engine_outranks_a_single_general_engine():
+    from search_mcp.aggregator import _merge
+
+    buckets = [
+        [_res("arxiv", "https://arxiv.org/abs/1", 1)],
+        [_res("duckduckgo", "https://blog.example/post", 1)],
+    ]
+    merged = _merge(buckets, 5, "paper")
+    assert merged[0]["url"] == "https://arxiv.org/abs/1"
+
+
+def test_the_boost_needs_a_category_to_apply_to():
+    """A plain web search has no native engines, so nothing is reweighted."""
+    from search_mcp.aggregator import _merge
+
+    buckets = [
+        [_res("arxiv", "https://arxiv.org/abs/1", 1)],
+        [_res("duckduckgo", "https://blog.example/post", 1)],
+    ]
+    merged = _merge(buckets, 5, None)
+    assert merged[0]["score"] == merged[1]["score"]
+
+
+def test_the_boost_follows_the_sub_group_token():
+    """An engine declaring `paper.biomed` declares `paper` too, so both tokens
+    resolve without the caller splitting anything."""
+    from search_mcp.aggregator import _native_engines
+
+    assert "europepmc" in _native_engines("paper")
+    assert "europepmc" in _native_engines("paper.biomed")
+    assert "europepmc" not in _native_engines("finance")
+    assert _native_engines(None) == frozenset()
+
+
+def test_a_general_engine_is_never_native_for_a_category():
+    from search_mcp.aggregator import _native_engines
+
+    assert "duckduckgo" not in _native_engines("paper")
+    assert "bing" not in _native_engines("finance.filings")
+
+
+def test_an_exclusive_category_reweights_everything_equally():
+    """`image`/`dataset` route ONLY to natives, so the weight is a uniform
+    scale factor and cannot change the order."""
+    from search_mcp.aggregator import _merge
+
+    buckets = [
+        [_res("openverse", "https://img.example/a", 1, title="Kitten")],
+        [_res("openverse", "https://img.example/b", 2, title="Puppy")],
+    ]
+    merged = _merge(buckets, 5, "image")
+    assert [r["url"] for r in merged] == [
+        "https://img.example/a",
+        "https://img.example/b",
+    ]

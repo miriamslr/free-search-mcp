@@ -17,6 +17,8 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from search_mcp.config import settings
 from search_mcp.engines import SearchFilters, SearchResult, get_engine
 from search_mcp.engines.base import (
@@ -390,3 +392,72 @@ def test_bing_parse_emits_publisher_urls():
     results = get_engine("bing").parse(html)
 
     assert [r.url for r in results] == [target]
+# ---------------------------------------------------------------------------
+# Brave — a comma selector must not emit every result twice
+# ---------------------------------------------------------------------------
+
+_BRAVE_HTML = """
+<div id="results">
+  <div class="snippet" data-type="web">
+    <a href="https://a.example/1"><span class="title">Alpha</span></a>
+    <div class="snippet-description">Alpha body text.</div>
+  </div>
+  <div class="snippet" data-type="web">
+    <a href="https://b.example/2"><span class="title">Beta</span></a>
+    <div class="snippet-description">Beta body text.</div>
+  </div>
+</div>
+"""
+
+
+def test_brave_parse_emits_each_result_once():
+    """selectolax concatenates a comma selector's match sets WITHOUT
+    deduplicating, so every `.snippet[data-type="web"]` inside `#results`
+    matched both halves of `'div.snippet[data-type="web"], #results .snippet'`
+    and was emitted twice.
+
+    Two consequences, both silent: half the `max_results` budget went to
+    duplicates, and the survivors were scored twice by the aggregator's RRF
+    merge, handing Brave roughly double the weight of every other engine. The
+    DuckDuckGo parser documents the same defect for its own former comma
+    selector.
+    """
+    out = get_engine("brave").parse(_BRAVE_HTML)
+    assert [r.url for r in out] == ["https://a.example/1", "https://b.example/2"]
+
+
+def test_brave_parse_dedups_a_repeated_url():
+    """Belt-and-braces: the same URL twice in one SERP is one result."""
+    doubled = _BRAVE_HTML.replace("https://b.example/2", "https://a.example/1")
+    out = get_engine("brave").parse(doubled)
+    assert [r.url for r in out] == ["https://a.example/1"]
+
+
+# ---------------------------------------------------------------------------
+# Chinese indexes — site:/-site:/filetype: are their ONLY filter channel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["sogou", "so360"])
+def test_cn_indexes_inject_query_operators(name):
+    """`sogou` and `so360` were the only web engines that never called
+    `augment_query_with_operators`.
+
+    Neither has a URL parameter for domain or filetype constraints, so the
+    engine returned unconstrained results and `apply_post_filters` then
+    discarded them wholesale — `include_domains` came back empty while DDG
+    returned ten, and the sparse-result hint blamed the filter rather than the
+    engine.
+    """
+    url = get_engine(name).build_url(
+        "asyncio",
+        10,
+        SearchFilters(
+            include_domains=["python.org"],
+            exclude_domains=["spam.example"],
+            category="pdf",
+        ),
+    )
+    assert "site%3Apython.org" in url
+    assert "-site%3Aspam.example" in url
+    assert "filetype%3Apdf" in url

@@ -9,7 +9,9 @@ fails a test instead of silently emptying the default pool.
 
 from __future__ import annotations
 
-from search_mcp.engines.bing import BingEngine
+import pytest
+
+from search_mcp.engines.bing import BingEngine, resolve_bing_url
 from search_mcp.engines.duckduckgo import DuckDuckGoEngine, _unwrap
 from search_mcp.engines.mojeek import MojeekEngine
 
@@ -165,6 +167,27 @@ _BING_HTML = """
 </body></html>
 """
 
+# What Bing actually serves today: every organic href is a click-tracking
+# redirect carrying the target base64url-encoded behind an "a1" tag.
+_BING_REDIRECT_HTML = """
+<html><body>
+  <ol id="b_results">
+    <li class="b_algo">
+      <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=deadbeefJmltdHM9MTc4Nzk2MTYwMA&amp;ptn=3&amp;ver=2&amp;fclid=abc&amp;psq=q&amp;u=a1aHR0cHM6Ly9kb2NzLnB5dGhvbi5vcmcvMy9saWJyYXJ5L2FzeW5jaW8uaHRtbA&amp;ntb=1">asyncio</a></h2>
+      <div class="b_caption"><p>Async IO.</p></div>
+    </li>
+    <li class="b_algo">
+      <h2><a href="https://www.bing.com/ck/a?!&amp;&amp;p=x&amp;u=zznot-base64!!&amp;ntb=1">Undecodable</a></h2>
+      <div class="b_caption"><p>Tag is not a1.</p></div>
+    </li>
+    <li class="b_algo">
+      <h2><a href="https://plain.example/direct">Already direct</a></h2>
+      <div class="b_caption"><p>No wrapper.</p></div>
+    </li>
+  </ol>
+</body></html>
+"""
+
 
 def test_bing_parse_extracts_organic_results():
     results = BingEngine().parse(_BING_HTML)
@@ -191,6 +214,42 @@ def test_bing_parse_ignores_ads_and_linkless_rows():
 def test_bing_parse_sets_date_hint():
     results = BingEngine().parse(_BING_HTML)
     assert results[0].published_age  # "3 hours ago" in the caption
+
+
+
+def test_bing_parse_unwraps_click_tracking_redirects():
+    """Every organic Bing href is a `bing.com/ck/a` redirect. Left wrapped,
+    `_host()` reports "www.bing.com" for all of them, so `include_domains`,
+    `exclude_domains` and every host-based `category` filter discard the WHOLE
+    engine — and the same page from another engine never dedupes against it, so
+    RRF cannot reward the agreement."""
+    results = BingEngine().parse(_BING_REDIRECT_HTML)
+    assert results[0].url == "https://docs.python.org/3/library/asyncio.html"
+
+
+def test_bing_leaves_an_unreadable_wrapper_alone():
+    """A wrapper we cannot decode is still followable; a mangled string is
+    not."""
+    results = BingEngine().parse(_BING_REDIRECT_HTML)
+    assert results[1].url.startswith("https://www.bing.com/ck/a")
+
+
+def test_bing_passes_a_direct_url_through_untouched():
+    results = BingEngine().parse(_BING_REDIRECT_HTML)
+    assert results[2].url == "https://plain.example/direct"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.bing.com/ck/a?u=a1",  # empty payload
+        "https://www.bing.com/ck/a?ntb=1",  # no u= at all
+        # Decodes cleanly but is not a URL — never hand that to `fetch`.
+        "https://www.bing.com/ck/a?u=a1bm90LWEtdXJs",
+    ],
+)
+def test_bing_unwrap_rejects_anything_that_is_not_an_http_url(url):
+    assert resolve_bing_url(url) == url
 
 
 def test_bing_parse_empty_shell_yields_nothing():

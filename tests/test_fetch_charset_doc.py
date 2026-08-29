@@ -70,3 +70,50 @@ def test_ctype_is_markup_treats_empty_as_recoverable():
     assert _ctype_is_markup("application/xml")
     assert not _ctype_is_markup("application/json")
     assert not _ctype_is_markup("text/plain")
+
+
+# --- read_doc honours the same charset the fetcher does --------------------
+#
+# `read_doc` used to hardcode `blob.decode("utf-8", errors="replace")` in every
+# text parser while `_read_remote` already had the Content-Type in hand and fed
+# it only to the format detector. So `fetch` rendered a GBK page correctly and
+# `read_doc` returned a screen of U+FFFD for the same URL — exactly the CJK
+# case `_decode_body`'s own comment says it exists for.
+
+
+def test_read_doc_html_parser_honours_header_charset():
+    from search_mcp.documents import _parse_html
+
+    body = "<html><body><p>中文正文</p></body></html>".encode("gbk")
+    assert "中文正文" in _parse_html(body, "text/html; charset=gbk")
+
+
+def test_read_doc_text_parser_honours_header_charset():
+    from search_mcp.documents import _parse_text
+
+    assert _parse_text("中文标题".encode("gbk"), "text/plain; charset=GBK") == "中文标题"
+
+
+def test_read_doc_csv_parser_honours_header_charset():
+    from search_mcp.documents import _parse_csv
+
+    table, _ = _parse_csv("列一,列二\n中文,值".encode("gbk"), "text/csv; charset=gbk")
+    assert "列一" in table and "中文" in table
+
+
+def test_read_doc_code_parser_honours_header_charset():
+    from search_mcp.documents import _parse_code
+
+    out = _parse_code("# 中文注释".encode("gbk"), "a.py", "text/plain; charset=gbk")
+    assert "中文注释" in out
+
+
+def test_read_doc_html_parser_sniffs_meta_charset_without_a_header():
+    """A local file has no Content-Type at all, so the in-document declaration
+    is the only signal there is."""
+    from search_mcp.documents import _parse_html
+
+    body = "<html><head><meta charset='gbk'></head><body><p>中文</p></body></html>".encode(
+        "gbk"
+    )
+    assert "中文" in _parse_html(body, "")

@@ -89,6 +89,7 @@ class BraveApiEngine(Engine):
     """Brave Search API — official, keyed (X-Subscription-Token), JSON GET."""
 
     name = "brave_api"
+    description = "Brave Search API — the keyed, captcha-free version of the `brave` engine."
     needs_browser = False
     # JSON API: an empty/malformed response is genuinely empty, so don't waste
     # a Playwright render trying to "recover" it (see Engine.search fallback).

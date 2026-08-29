@@ -1,7 +1,6 @@
 import base64
 import binascii
-import re
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from ..config import settings
 from .base import (
@@ -16,11 +15,14 @@ from .base import (
     text_of,
 )
 
-# Organic Bing hrefs are frequently wrapped in a click-tracking redirect:
-#   https://www.bing.com/ck/a?!&&p=<hash>&u=a1<base64url of the real URL>&ntb=1
-# The `u` value carries a 2-character type prefix ("a1") in front of the
-# base64url payload.
-_BING_REDIRECT_U = re.compile(r"[?&]u=([A-Za-z0-9+/_=-]+)")
+# Every organic Bing result now arrives as a click-tracking redirect
+# (`www.bing.com/ck/a?…&u=a1<base64url>&…`) rather than as the target URL. Left
+# alone, that breaks three things at once: `_host()` reports "www.bing.com", so
+# `include_domains` / `exclude_domains` and every host-based `category` filter
+# silently discard ALL of this engine's results; the same page found by another
+# engine never dedupes against it, so RRF cannot reward the agreement; and the
+# caller is handed an opaque blob instead of a link. The `u` parameter is the
+# target, base64url-encoded behind a two-character tag ("a1" in practice).
 
 
 def resolve_bing_url(raw_url: str) -> str:
@@ -33,13 +35,16 @@ def resolve_bing_url(raw_url: str) -> str:
     max_results on duplicates. It also hands the model a link that says nothing
     about the publisher and cannot be judged for relevance without fetching it.
 
-    Anything that is not a decodable wrapper is returned unchanged — a working
-    redirect link beats dropping the result.
+    Only ck/a URLs are touched, and only a decoded absolute http(s) URL is
+    accepted: `u=` is an ordinary parameter name that other sites use for their
+    own purposes, and rewriting one of those to whatever its value happens to
+    base64-decode into would corrupt a perfectly good link. Anything else is
+    returned unchanged — a working redirect beats dropping the result.
     """
-    match = _BING_REDIRECT_U.search(raw_url)
-    if not match:
+    if "bing.com/ck/a" not in raw_url:
         return raw_url
-    encoded = match.group(1)
+    encoded = parse_qs(urlparse(raw_url).query).get("u", [""])[0]
+    # Two-character type tag, then the payload.
     if len(encoded) < 3:
         return raw_url
     payload = encoded[2:]
@@ -50,7 +55,7 @@ def resolve_bing_url(raw_url: str) -> str:
         decoded = base64.b64decode(padded).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError, ValueError):
         return raw_url
-    return decoded if decoded.startswith("http") else raw_url
+    return decoded if decoded.startswith(("http://", "https://")) else raw_url
 
 
 # Bing's documented freshness filter values.
@@ -64,6 +69,7 @@ _BING_FRESHNESS = {
 
 class BingEngine(Engine):
     name = "bing"
+    description = "Microsoft Bing web results over plain HTTP — broad index, sub-second responses."
     # The www4 edge serves 10 real organic results over plain HTTP in ~0.3s
     # (verified), so we try HTTP FIRST and only pay for a Playwright render when
     # parse() comes back empty (a real gate) via the inherited
@@ -118,6 +124,11 @@ class BingEngine(Engine):
     def parse(self, html: str) -> list[SearchResult]:
         tree = parse_html(html)
         results: list[SearchResult] = []
+        seen: set[str] = set()
+        # Guard against a SERP repeating a URL (and against a future markup
+        # change re-introducing a double match): a duplicate inside one bucket
+        # scores twice in the aggregator's RRF merge, inflating this engine's
+        # weight, and eats a slot in the max_results budget.
         for li in tree.css("li.b_algo"):
             link = li.css_first("h2 a")
             if not link:
@@ -131,8 +142,9 @@ class BingEngine(Engine):
                 or li.css_first(".b_paractl")
             )
             snippet = text_of(snippet_node)
-            if not url or not title:
+            if not url or not title or url in seen:
                 continue
+            seen.add(url)
             result = SearchResult(title=title, url=url, snippet=snippet, engine=self.name, rank=0)
             hint = extract_date_hint(snippet) or extract_date_hint(title)
             if hint:

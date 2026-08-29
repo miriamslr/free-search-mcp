@@ -42,6 +42,7 @@ class GitHubEngine(JsonApiEngine):
     """GitHub repository + issue search (keyless, optional token)."""
 
     name = "github"
+    description = "GitHub repository and issue search."
     categories = frozenset({"github"})
 
     def build_url(
@@ -164,6 +165,7 @@ class GitHubCodeEngine(JsonApiEngine):
     """GitHub code-content search — requires a token (GitHub 401s anonymously)."""
 
     name = "github_code"
+    description = "GitHub code search across public repositories (needs a token)."
     categories = frozenset({"github"})
 
     def is_available(self) -> bool:

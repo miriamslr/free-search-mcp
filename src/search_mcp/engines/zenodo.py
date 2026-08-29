@@ -9,6 +9,7 @@ explains them.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -17,11 +18,16 @@ from .jsonapi import JsonApiEngine, clip
 
 _ENDPOINT = "https://zenodo.org/api/records"
 
+# Zenodo descriptions are HTML. Precompiled at module scope like every
+# other tag-stripper in this package (cf. crossref, wikipedia).
+_TAG_RE = re.compile(r"<[^>]+>")
+
 
 class ZenodoEngine(JsonApiEngine):
     """Zenodo dataset/software/publication search (keyless JSON API)."""
 
     name = "zenodo"
+    description = "Zenodo — CERN's repository of datasets, software and publications."
     categories = frozenset({"dataset"})
     # Zenodo answers 403 to clients presenting a browser TLS/header
     # fingerprint on its API. Identify honestly instead.
@@ -105,7 +111,5 @@ class ZenodoEngine(JsonApiEngine):
                 bits.append(", ".join(names[:3]) + (" et al." if len(names) > 3 else ""))
         description = meta.get("description")
         if isinstance(description, str) and description:
-            import re
-
-            bits.append(re.sub(r"<[^>]+>", " ", description))
+            bits.append(_TAG_RE.sub(" ", description))
         return clip(" — ".join(bits))

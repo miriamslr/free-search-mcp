@@ -125,7 +125,17 @@ async def research(
     # caller. Without this, `research(..., category="news")` that filtered every
     # hit away returned an empty brief with no stated reason — strictly less
     # informative than calling `search` with the same arguments.
-    for key in ("filter_diagnostics", "gated_hint", "empty_hint", "rescued_via"):
+    for key in (
+        "filter_diagnostics",
+        "gated_engines",
+        "gated_hint",
+        "empty_engines",
+        "empty_hint",
+        "refused_engines",
+        "rate_limited_engines",
+        "rate_limited_hint",
+        "rescued_via",
+    ):
         if sr.get(key):
             out[key] = sr[key]
     return out

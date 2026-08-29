@@ -20,7 +20,7 @@ Caveats:
 
 from __future__ import annotations
 
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 from ..config import settings
 from .base import (
@@ -54,20 +54,40 @@ _INTERNAL_HREF_PREFIXES = (
 )
 
 
-def _unwrap(href: str) -> str:
-    """Turn a Google ``/url?q=<target>&...`` redirect into its real target.
+_ORIGIN = "https://www.google.com/"
 
-    Google sometimes wraps organic links in a redirect of the form
-    ``/url?q=https%3A%2F%2Fexample.com%2F&sa=...``. ``parse_qs`` already
-    percent-decodes the ``q`` value once, so we return it verbatim. Anything
-    that isn't a recognised ``/url?`` wrapper is returned unchanged.
+
+def _unwrap(href: str) -> str:
+    """Turn a Google ``/url?...`` redirect into its real target, absolutised.
+
+    Google wraps organic links in a redirect that carries the destination under
+    ``q`` (``/url?q=https%3A%2F%2Fexample.com%2F&sa=...``) OR under ``url``
+    (``/url?esrc=s&q=&url=https%3A%2F%2Fexample.com%2F&ved=...``). The second
+    form matters more than it looks: ``q`` is *present but empty* there, and
+    ``parse_qs`` drops blank values by default, so checking only ``q`` let the
+    whole wrapper through unchanged.
+
+    Whatever comes out is then resolved against the Google origin. A relative
+    href that escapes this function is worse than useless downstream: the LLM
+    cites a path it cannot ``fetch``, and ``urlparse(...).hostname`` returns
+    ``""`` so every domain and category post-filter silently discards it.
+
+    ``parse_qs`` already percent-decodes once, so the extracted value is used
+    verbatim.
     """
     if not href:
         return href
-    if href.startswith("/url?") or href.startswith("/url?q="):
+    if href.startswith("/url?"):
         qs = parse_qs(urlparse(href).query)
-        if "q" in qs and qs["q"]:
-            return qs["q"][0]
+        for key in ("q", "url"):
+            values = qs.get(key)
+            if values and values[0]:
+                href = values[0]
+                break
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return urljoin(_ORIGIN, href)
     return href
 
 
@@ -81,6 +101,7 @@ class GoogleEngine(Engine):
     """Keyless Google web SERP scraper — anonymous HTTP, browser fallback."""
 
     name = "google"
+    description = "Google web SERP scraped over HTTP; the broadest index when it is not gated."
     needs_browser = False
     # Leave supports_browser_fallback = True (the base default): Google often
     # serves a JS/consent shell to plain HTTP, parse()==[] then recovers via a

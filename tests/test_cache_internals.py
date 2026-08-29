@@ -256,3 +256,126 @@ async def test_writes_trigger_maintenance_on_cadence(fresh_cache, monkeypatch):
     await asyncio.sleep(0)
     assert len(calls) == 2  # at write #5 and #10
     await fresh_cache.close()
+
+
+# --- FTS index stays in sync with the content table ------------------------
+
+
+async def test_refetching_a_url_keeps_it_findable(fresh_cache):
+    """The regression that made `cache_search` useless.
+
+    `INSERT OR REPLACE` resolved the url conflict by DELETING the old row and
+    inserting a new one with a NEW rowid — and SQLite fires DELETE triggers on
+    that path only when `recursive_triggers` is on, which it is not by default.
+    So every re-fetch orphaned the old rowid's postings. External-content FTS5
+    reads column values back from `pages` by rowid, so the first orphan made
+    EVERY query raise `fts5: missing row N`, which the malformed-query handler
+    swallowed into "no cached pages match".
+    """
+    for i in range(4):
+        await fresh_cache.put_page(
+            "https://example.com/a", f"Title {i}", f"body revision {i} zebrafish"
+        )
+    hits = await fresh_cache.search_pages("zebrafish")
+    assert [h["url"] for h in hits] == ["https://example.com/a"]
+    await fresh_cache.close()
+
+
+async def test_refetching_replaces_the_old_text_in_the_index(fresh_cache):
+    """Stale content must not stay searchable — the update trigger has to
+    delete the old FTS row, not just add a second one."""
+    await fresh_cache.put_page("https://example.com/a", "T", "aardvark original")
+    await fresh_cache.put_page("https://example.com/a", "T", "buffalo replacement")
+    assert await fresh_cache.search_pages("aardvark") == []
+    assert len(await fresh_cache.search_pages("buffalo")) == 1
+    await fresh_cache.close()
+
+
+async def test_refetching_keeps_the_rowid(fresh_cache):
+    """Rowid stability is the whole mechanism: it is the key the FTS index and
+    the content table agree on."""
+    await fresh_cache.put_page("https://example.com/a", "T", "one")
+    conn = await fresh_cache._conn()
+    cur = await conn.execute("SELECT rowid FROM pages WHERE url = 'https://example.com/a'")
+    before = (await cur.fetchone())[0]
+    await fresh_cache.put_page("https://example.com/a", "T", "two")
+    cur = await conn.execute("SELECT rowid FROM pages WHERE url = 'https://example.com/a'")
+    assert (await cur.fetchone())[0] == before
+    await fresh_cache.close()
+
+
+async def test_fts_integrity_survives_many_rewrites(fresh_cache):
+    """FTS5's own checker is the authority on whether the index is sane."""
+    for i in range(6):
+        await fresh_cache.put_page("https://example.com/a", "T", f"content {i}")
+        await fresh_cache.put_page("https://example.com/b", "T", f"other {i}")
+    conn = await fresh_cache._conn()
+    await conn.execute("INSERT INTO pages_fts(pages_fts) VALUES('integrity-check')")
+    await fresh_cache.close()
+
+
+async def test_a_desynced_index_is_rebuilt_instead_of_reported_as_empty(fresh_cache):
+    """Caches written by earlier versions are already poisoned, so the read
+    path has to repair rather than silently return nothing."""
+    await fresh_cache.put_page("https://example.com/a", "T", "narwhal")
+    conn = await fresh_cache._conn()
+    # Forge exactly the corruption REPLACE used to leave behind: a posting for
+    # a rowid the content table does not have.
+    await conn.execute(
+        "INSERT INTO pages_fts(rowid, url, title, content) "
+        "VALUES (9999, 'https://example.com/ghost', 'ghost', 'narwhal')"
+    )
+    await conn.commit()
+    with pytest.raises(Exception):
+        cur = await conn.execute("SELECT url FROM pages_fts WHERE pages_fts MATCH 'narwhal'")
+        await cur.fetchall()
+
+    hits = await fresh_cache.search_pages("narwhal")
+    assert [h["url"] for h in hits] == ["https://example.com/a"]
+    await fresh_cache.close()
+
+
+async def test_a_malformed_query_is_still_just_no_matches(fresh_cache):
+    """The rebuild path must not swallow the syntax-error path it sits next
+    to — a bad query is a user error, not a corrupt index."""
+    await fresh_cache.put_page("https://example.com/a", "T", "narwhal")
+    assert await fresh_cache.search_pages('"unclosed') == []
+    assert await fresh_cache.search_pages("nosuchcol:x") == []
+    await fresh_cache.close()
+
+
+async def test_existing_caches_are_rebuilt_once_on_open(tmp_path, monkeypatch):
+    """A file written before the fix carries orphaned postings, and only a
+    rebuild clears them. `user_version` gates it to once per file — the
+    rebuild is O(corpus) and must not run on every start.
+    """
+    import sqlite3
+
+    from search_mcp import cache as cache_mod
+    from search_mcp.config import settings
+
+    monkeypatch.setattr(settings, "cache_dir", tmp_path)
+    path = tmp_path / "legacy.sqlite"
+
+    first = cache_mod.Cache()
+    first._path = str(path)
+    await first.put_page("https://example.com/a", "T", "pangolin")
+    conn = await first._conn()
+    # Undo the version stamp and forge the legacy damage.
+    await conn.execute("PRAGMA user_version=0")
+    await conn.execute(
+        "INSERT INTO pages_fts(rowid, url, title, content) "
+        "VALUES (4242, 'https://example.com/ghost', 'g', 'pangolin')"
+    )
+    await conn.commit()
+    await first.close()
+
+    reopened = cache_mod.Cache()
+    reopened._path = str(path)
+    hits = await reopened.search_pages("pangolin")
+    assert [h["url"] for h in hits] == ["https://example.com/a"]
+    await reopened.close()
+
+    stamped = sqlite3.connect(str(path))
+    assert stamped.execute("PRAGMA user_version").fetchone()[0] == cache_mod._USER_VERSION
+    stamped.close()

@@ -14,7 +14,7 @@ from pypdf import PdfReader
 
 from .config import settings
 from .formatting import estimate_tokens, smart_truncate
-from .httpfetch import httpx_client_kwargs, httpx_stream_capped
+from .httpfetch import _decode_body, httpx_client_kwargs, httpx_stream_capped
 from .url_safety import assert_url_allowed_async
 
 log = logging.getLogger(__name__)
@@ -203,19 +203,19 @@ def _parse_docx(blob: bytes) -> tuple[str, bool]:
     return "\n\n".join(parts), truncated
 
 
-def _parse_html(blob: bytes) -> str:
-    html = blob.decode("utf-8", errors="replace")
+def _parse_html(blob: bytes, ctype: str = "") -> str:
+    html = _decode_body(blob, ctype)
     return html_to_md(html, heading_style="ATX", bullets="-").strip()
 
 
-def _parse_text(blob: bytes) -> str:
-    return blob.decode("utf-8", errors="replace")
+def _parse_text(blob: bytes, ctype: str = "") -> str:
+    return _decode_body(blob, ctype)
 
 
-def _parse_code(blob: bytes, source: str) -> str:
+def _parse_code(blob: bytes, source: str, ctype: str = "") -> str:
     """Source/config file, fenced with its language so it renders as code."""
     lang = _CODE_LANGS.get(_ext(source), "")
-    text = blob.decode("utf-8", errors="replace")
+    text = _decode_body(blob, ctype)
     # Pick a fence longer than any run of backticks inside the file, or a file
     # containing a Markdown fence would break out of ours.
     longest = 0
@@ -245,11 +245,11 @@ def _rows_to_markdown(rows: list[list[str]], max_cols: int = 30) -> str:
     return "\n".join(out)
 
 
-def _parse_csv(blob: bytes) -> tuple[str, bool]:
+def _parse_csv(blob: bytes, ctype: str = "") -> tuple[str, bool]:
     """CSV/TSV to a Markdown table, capped at max_document_chars."""
     import csv as _csv
 
-    text = blob.decode("utf-8", errors="replace")
+    text = _decode_body(blob, ctype)
     sample = text[:8192]
     try:
         dialect = _csv.Sniffer().sniff(sample, delimiters=",;\t|")
@@ -350,7 +350,10 @@ def _parse_epub(blob: bytes) -> tuple[str, str, bool]:
     acc = 0
     truncated = False
     for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-        html = item.get_content().decode("utf-8", errors="replace")
+        # EPUB items are XHTML inside a zip: there is no HTTP header to consult,
+        # but the XML/meta charset declaration inside the document is, and
+        # decode_body sniffs it when the caller says "html".
+        html = _decode_body(item.get_content(), "text/html")
         md = html_to_md(html, heading_style="ATX", bullets="-").strip()
         if not md:
             continue
@@ -567,6 +570,7 @@ async def read_document(
     else:
         path = _resolve_local_path(source)
         blob = path.read_bytes()
+        ctype = ""
         fmt = _detect_format(str(path))
 
     title = ""
@@ -587,7 +591,7 @@ async def read_document(
             log.info("%s parse failed for %s; falling back to HTML: %s", fmt, source, e)
             fmt = "html"
             pages = None
-            full = _parse_html(blob)
+            full = _parse_html(blob, ctype)
     elif fmt in ("xlsx", "pptx", "epub"):
         # Same soft-failure story as pdf/docx: the extension promised an Office
         # container but the body may be an HTML wall or error page.
@@ -602,17 +606,17 @@ async def read_document(
             log.info("%s parse failed for %s; falling back to HTML: %s", fmt, source, e)
             fmt = "html"
             pages = None
-            full = _parse_html(blob)
+            full = _parse_html(blob, ctype)
     elif fmt == "csv":
-        full, doc_truncated = _parse_csv(blob)
+        full, doc_truncated = _parse_csv(blob, ctype)
     elif fmt == "archive":
         full, doc_truncated = _parse_archive(blob, source)
     elif fmt == "code":
-        full = _parse_code(blob, source)
+        full = _parse_code(blob, source, ctype)
     elif fmt == "html":
-        full = _parse_html(blob)
+        full = _parse_html(blob, ctype)
     elif fmt in ("text", "markdown"):
-        full = _parse_text(blob)
+        full = _parse_text(blob, ctype)
     elif fmt == "image":
         # read_doc extracts text; an image has none. Point at the tool that
         # can actually describe it rather than returning an empty document.

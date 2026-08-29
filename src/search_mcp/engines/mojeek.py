@@ -20,6 +20,9 @@ class MojeekEngine(Engine):
     """Independent search index, no JS gating, no API key, stable HTML."""
 
     name = "mojeek"
+    description = (
+        "Independent web crawler — surfaces pages the Google/Bing-derived engines never show."
+    )
     needs_browser = False
 
     def build_url(
@@ -52,6 +55,11 @@ class MojeekEngine(Engine):
     def parse(self, html: str) -> list[SearchResult]:
         tree = parse_html(html)
         results: list[SearchResult] = []
+        seen: set[str] = set()
+        # Guard against a SERP repeating a URL (and against a future markup
+        # change re-introducing a double match): a duplicate inside one bucket
+        # scores twice in the aggregator's RRF merge, inflating this engine's
+        # weight, and eats a slot in the max_results budget.
         for li in tree.css("ul.results-standard li"):
             link = li.css_first("h2 a.title")
             if not link:
@@ -59,8 +67,9 @@ class MojeekEngine(Engine):
             url = link.attributes.get("href", "")
             title = text_of(link)
             snippet = text_of(li.css_first("p.s"))
-            if not url or not title:
+            if not url or not title or url in seen:
                 continue
+            seen.add(url)
             result = SearchResult(title=title, url=url, snippet=snippet, engine=self.name, rank=0)
             hint = extract_date_hint(snippet) or extract_date_hint(title)
             if hint:

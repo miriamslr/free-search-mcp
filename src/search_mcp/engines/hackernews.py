@@ -25,6 +25,7 @@ class HackerNewsEngine(JsonApiEngine):
     """Hacker News discussion search (keyless Algolia API)."""
 
     name = "hackernews"
+    description = "Hacker News stories and the discussion threads attached to them."
     categories = frozenset({"forum"})
 
     def build_url(

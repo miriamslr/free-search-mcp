@@ -33,6 +33,7 @@ def _unwrap(url: str) -> str:
 
 class DuckDuckGoEngine(Engine):
     name = "duckduckgo"
+    description = "General web index; the fastest and most dependable of the keyless defaults."
     needs_browser = False
 
     def build_url(

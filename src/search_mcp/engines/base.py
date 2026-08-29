@@ -23,7 +23,56 @@ from ..httpfetch import IMPERSONATE
 from ..net import curl_proxy_kwargs
 
 Freshness = Literal["day", "week", "month", "year"]
-Category = Literal["news", "pdf", "github", "paper", "forum", "blog", "image", "dataset"]
+
+# Two aliases, two jobs. Keeping them apart is what lets the dotted sub-category
+# tokens exist without every `filters.category == "pdf"` site in the engines
+# having to learn about them.
+#
+#   CategoryGroup — the INTERNAL filter predicate. `SearchFilters.category` is
+#       always one of these, never dotted: `aggregate_search` splits the caller's
+#       token at the first "." before building the filters. So the post-filter
+#       branches below, `finalize_results`, and the eleven engines that special-
+#       case `category == "pdf"` all keep comparing bare strings.
+#
+#   Category — the AGENT-FACING enum. `server.search` / `server.research` type
+#       their `category` parameter with this, so the JSON Schema the model reads
+#       lists every group AND every sub-group. That enum is the only taxonomy an
+#       LLM reliably sees at call time, which is why the sub-groups live here
+#       rather than in a lookup table it would have to go fetch.
+#
+# A bare group WIDENS (the specialists for that group, round-robined across
+# sub-groups so one sub-group can't monopolise `category_engine_limit`); a
+# dotted sub-group NARROWS to the sources that index exactly that.
+CategoryGroup = Literal[
+    "news", "pdf", "github", "paper", "forum", "blog", "image", "dataset", "finance"
+]
+Category = Literal[
+    # Groups
+    "news", "pdf", "github", "paper", "forum", "blog", "image", "dataset", "finance",
+    # Sub-groups. Each must be `<group>.<name>` with `<group>` in CategoryGroup,
+    # and at least one registered engine must declare it — both are asserted in
+    # tests/test_source_taxonomy.py.
+    "news.world",
+    "paper.index",
+    "paper.preprint",
+    "paper.biomed",
+    "paper.cs",
+    "paper.openaccess",
+    "paper.trial",
+    "finance.filings",
+    "finance.market",
+    "finance.macro",
+]
+
+
+def category_group(category: str | None) -> str | None:
+    """The group half of a category token: `"paper.biomed"` -> `"paper"`.
+
+    Bare groups pass through unchanged, `None` stays `None`.
+    """
+    if not category:
+        return None
+    return category.split(".", 1)[0]
 
 
 # Date-extraction patterns. Order matters: relative phrases ("2 days ago")
@@ -148,6 +197,25 @@ _PAPER_HOSTS = (
     "oup.com",
     "sagepub.com",
 )
+
+# Subdomains of allowlisted publishers that are NOT scholarly. `_host_matches`
+# accepts any subdomain of an entry, which is what makes the list short — but
+# the big presses also run dictionaries and bookshops on the same domain, and
+# those sailed through as papers. Measured: `category="paper"` on "what is
+# reciprocal rank fusion" dropped 54 of 56 raw results and kept Cambridge
+# Dictionary's entry for the word "reciprocal" as its single source.
+#
+# Checked BEFORE the allowlist, so a specific exclusion always beats a general
+# inclusion. Kept deliberately small: each entry is a host observed passing the
+# filter while being obviously not a paper, not a guess about what might.
+_NOT_PAPER_HOSTS = (
+    "dictionary.cambridge.org",
+    "shop.cambridge.org",
+    "global.oup.com",
+    "academic.oup.com/pages",
+    "us.sagepub.com",
+    "uk.sagepub.com",
+)
 _FORUM_HOSTS = (
     "reddit.com",
     "news.ycombinator.com",
@@ -250,7 +318,19 @@ class SearchFilters:
     freshness: Freshness | None = None
     include_domains: list[str] = field(default_factory=list)
     exclude_domains: list[str] = field(default_factory=list)
-    category: Category | None = None
+    #: ALWAYS a bare group, never a dotted sub-group. `aggregate_search` is the
+    #: only place in `src/` that constructs a SearchFilters, and it splits the
+    #: caller's token before getting here — so everything downstream (the
+    #: post-filter branches, `finalize_results`, the engines' `== "pdf"` checks)
+    #: can keep comparing plain strings.
+    category: CategoryGroup | None = None
+    #: The exact token the caller passed, e.g. `"paper.biomed"`. Engines that
+    #: serve more than one sub-group read this to pick a mode (Europe PMC
+    #: switches to preprints-only for `paper.preprint`). Equal to `category`
+    #: when the caller named a bare group. Not part of `is_empty()`: it is never
+    #: set without `category`, so it can't make an otherwise-empty filter set
+    #: look non-empty.
+    category_token: Category | None = None
     include_text: str | None = None
     exclude_text: str | None = None
 
@@ -303,6 +383,13 @@ def _host_matches(host: str, suffixes: tuple[str, ...] | list[str]) -> bool:
     if not host:
         return False
     return any(host == s or host.endswith("." + s) for s in suffixes)
+
+
+def _is_paper_host(host: str) -> bool:
+    """A scholarly host, and not one of the presses' non-scholarly siblings."""
+    if _host_matches(host, _NOT_PAPER_HOSTS):
+        return False
+    return _host_matches(host, _PAPER_HOSTS)
 
 
 def _strip_query(url: str) -> str:
@@ -440,7 +527,7 @@ def apply_post_filters_with_diagnostics(
             _bump("category_pdf")
             continue
         if not native_category:
-            if filters.category == "paper" and not _host_matches(host, _PAPER_HOSTS):
+            if filters.category == "paper" and not _is_paper_host(host):
                 _bump("category_paper")
                 continue
             if filters.category == "forum" and not _host_matches(host, _FORUM_HOSTS):
@@ -925,6 +1012,16 @@ class Engine(abc.ABC):
     name: str
     needs_browser: bool = False
     wait_selector: str | None = None
+    # One line, no newlines, ~90 chars or fewer: what this source actually
+    # indexes and when to reach for it. The `engines` tool renders these into
+    # the group/sub-group tree it hands the model, so this is THE description an
+    # LLM reads when choosing a source. It lives next to the engine rather than
+    # in a table in server.py precisely so it cannot rot away from the code —
+    # the hand-maintained buckets it replaces had been advertising `pubmed` for
+    # `category="paper"` long after the engine-limit stopped it from ever
+    # running. Every registered engine must set it (asserted in
+    # tests/test_source_taxonomy.py).
+    description: str = ""
     # Categories this engine natively indexes, from the `Category` literal
     # above. Empty (the default) means "general web" — the engine has no
     # special claim on any category and is only used when asked for by name or
@@ -934,6 +1031,14 @@ class Engine(abc.ABC):
     # pulls these engines in when a caller asks for that category, because
     # asking a general web engine for `category="paper"` can only ever filter
     # its results by hostname, whereas arXiv actually indexes papers.
+    #
+    # An engine that serves a sub-group MUST declare the parent group too:
+    #     categories = frozenset({"paper", "paper.biomed"})
+    # Declaring only `"paper.biomed"` would keep it out of `category="paper"`
+    # routing AND, worse, cost it the `native` bypass in `finalize_results`, so
+    # its own europepmc.org/doi.org URLs would be filtered out by the hostname
+    # allowlist that exists only to approximate the category for general web
+    # engines. The rule is asserted in tests/test_source_taxonomy.py.
     categories: frozenset[str] = frozenset()
     # Per-engine override for the aggregator's rate limiter, when the source
     # documents a stricter rule than settings.rate_limit_per_minute. None means

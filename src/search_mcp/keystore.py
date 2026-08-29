@@ -302,6 +302,34 @@ PROVIDERS: list[Provider] = [
         optional=True,
     ),
     Provider(
+        id="semanticscholar",
+        label="Semantic Scholar (optional key)",
+        engine="semanticscholar",
+        fields=[
+            ProviderField(
+                "semanticscholar_api_key",
+                "API key (optional but recommended)",
+                required=False,
+                placeholder="leave blank to try the shared anonymous pool",
+            )
+        ],
+        signup_url="https://www.semanticscholar.org/product/api#api-key-form",
+        free_tier="anonymous requests share one saturated pool and are answered "
+        "with HTTP 429 in practice; a free key gives 1 request/second",
+        how_to=[
+            "Semantic Scholar has the richest metadata of the keyless scholarly "
+            "sources — abstracts, citation counts and open-access PDF links.",
+            "Its anonymous tier is a shared bucket that is effectively always "
+            "rate-limited, so without a key this engine usually returns nothing.",
+            "Request a free key at "
+            "https://www.semanticscholar.org/product/api#api-key-form — approval "
+            "is by email and takes a few days.",
+            "Paste the key here; `category=\"paper\"` will then include it.",
+        ],
+        docs_url="https://api.semanticscholar.org/api-docs/graph",
+        optional=True,
+    ),
+    Provider(
         id="github",
         label="GitHub",
         engine="github",

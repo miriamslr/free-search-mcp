@@ -16,7 +16,15 @@ from __future__ import annotations
 from urllib.parse import quote_plus
 
 from ..config import settings
-from .base import Engine, SearchFilters, SearchResult, extract_date_hint, parse_html, text_of
+from .base import (
+    Engine,
+    SearchFilters,
+    SearchResult,
+    augment_query_with_operators,
+    extract_date_hint,
+    parse_html,
+    text_of,
+)
 
 _ENDPOINT = "https://www.so.com/s"
 
@@ -28,13 +36,27 @@ class So360Engine(Engine):
     """360 搜索 web results (keyless HTML scrape)."""
 
     name = "so360"
+    description = "360 搜索 — third Chinese web index, with direct target URLs."
 
     def build_url(
         self, query: str, max_results: int, filters: SearchFilters | None = None
     ) -> str:
         # 360 pages in tens; asking for more than 50 just returns the same page.
         n = max(10, min(max_results, 50))
-        params = [f"q={quote_plus(query)}", f"rn={n}"]
+        filetype = "pdf" if filters and filters.category == "pdf" else None
+        # site:/-site:/filetype: are understood by both Chinese indexes, and
+        # they are the ONLY way these filters reach the engine — there are no
+        # dedicated URL parameters for them. Without this the engine returned
+        # unconstrained results that `apply_post_filters` then discarded
+        # wholesale, so an include_domains search came back empty and the
+        # sparse-result hint blamed the filter instead of the engine.
+        q = augment_query_with_operators(
+            query,
+            include_domains=filters.include_domains if filters else None,
+            exclude_domains=filters.exclude_domains if filters else None,
+            filetype=filetype,
+        )
+        params = [f"q={quote_plus(q)}", f"rn={n}"]
         if filters and filters.freshness:
             token = _FRESHNESS.get(filters.freshness)
             if token:

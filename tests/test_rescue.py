@@ -68,12 +68,14 @@ class _StubEngine:
 class _StubCache:
     def __init__(self):
         self.put_calls: list = []
+        self.meta_calls: list = []
 
     async def get_search(self, key, max_age_seconds=None):
         return None
 
-    async def put_search(self, key, query, engines, results):
+    async def put_search(self, key, query, engines, results, meta=None):
         self.put_calls.append((key, query, engines, results))
+        self.meta_calls.append(meta)
 
 
 def _wire(monkeypatch, engines: dict[str, _StubEngine]) -> _StubCache:
@@ -301,3 +303,74 @@ async def test_failed_rescue_probe_does_not_pollute_caller_diagnostics(monkeypat
     assert "searx" not in (out.get("gated_engines") or {})
     # The probe's outcome is still visible under the rescue summary for debugging.
     assert out.get("gated_engines") is None or "searx" not in out["gated_engines"]
+
+
+async def test_rescue_provenance_survives_the_cache_round_trip(monkeypatch):
+    """A cache hit must not silently re-label a rescued result set as normal.
+
+    The rescue path writes its results into the cache under the ORIGINAL engine
+    list, but the cache-hit branch only ever rebuilt `query/engines/cached/
+    results/lead_snippet`. So the first query reported "duckduckgo was
+    captcha-gated -> served via searx" and the second identical query, any time
+    inside the 7-day TTL, reported a plain search over the same URLs. That is
+    provenance describing the RESULTS, not a statistic about the run, so it has
+    to be stored and replayed with them.
+    """
+    from search_mcp import aggregator as agg
+
+    gated = _StubEngine("duckduckgo", results=[], gate="captcha")
+    rescuer = _StubEngine("searx", results=_mk_results("searx", 1))
+    stub_cache = _wire(monkeypatch, {"duckduckgo": gated, "searx": rescuer})
+    monkeypatch.setattr(agg.settings, "rescue_enabled", True)
+    monkeypatch.setattr(agg.settings, "rescue_engines", ["searx"])
+
+    fresh = await agg.aggregate_search(
+        "q", engines=["duckduckgo"], max_results=3, use_cache=True
+    )
+    assert fresh["rescued_via"] == "searx"
+    assert fresh["gated_engines"]["duckduckgo"]["reason"] == "captcha"
+
+    # The provenance was handed to the cache alongside the results.
+    assert stub_cache.meta_calls, "put_search must receive the provenance meta"
+    meta = stub_cache.meta_calls[-1]
+    assert meta["rescued_via"] == "searx"
+    assert meta["gated_engines"]["duckduckgo"]["fallback"] == "searx"
+
+    # ...and replaying that row reproduces it.
+    key, _query, _engines, results = stub_cache.put_calls[-1]
+
+    async def _hit(k, max_age_seconds=None):
+        return (results, meta) if k == key else None
+
+    monkeypatch.setattr(stub_cache, "get_search", _hit)
+    cached = await agg.aggregate_search(
+        "q", engines=["duckduckgo"], max_results=3, use_cache=True
+    )
+    assert cached["cached"] is True
+    assert cached["rescued_via"] == "searx"
+    assert cached["gated_engines"]["duckduckgo"]["reason"] == "captcha"
+    assert "served via searx" in cached["gated_hint"]
+
+
+# --- exclusive categories must never rescue into the general web pool -------
+
+
+@pytest.mark.parametrize("category", ["image", "dataset", "image.photo"])
+def test_exclusive_categories_do_not_rescue(category):
+    """`settings.rescue_engines` IS the general web pool, and the whole reason
+    `image`/`dataset` replace that pool is that a web engine cannot return an
+    image file or a dataset record. Rescuing into it hands back the wrong media
+    type — HTML pages `fetch(inline=True)` cannot render — under a header
+    saying the search succeeded."""
+    from search_mcp.aggregator import _needs_rescue
+
+    assert _needs_rescue([], {"openverse": "boom"}, {}, category) is False
+
+
+@pytest.mark.parametrize("category", [None, "paper", "news", "finance.filings"])
+def test_augmenting_categories_still_rescue(category):
+    """Those keep the web pool in the request, so a web engine standing in for
+    a gated web engine is a substitution of like for like."""
+    from search_mcp.aggregator import _needs_rescue
+
+    assert _needs_rescue([], {"duckduckgo": "boom"}, {}, category) is True

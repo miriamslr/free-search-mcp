@@ -61,6 +61,24 @@ END;
 """
 
 
+def _is_fts_desync(exc: BaseException) -> bool:
+    """True for FTS5's "the index and the content table disagree" errors.
+
+    External-content FTS5 stores only the postings and reads column values back
+    from `pages` by rowid, so a posting for a row that is gone is reported as
+    `fts5: missing row N from content table 'main'.'pages'` — a corruption
+    signal, not the malformed-query error the caller's handler is written for.
+    """
+    text = str(exc).lower()
+    return "fts5" in text and ("missing row" in text or "corrupt" in text)
+
+
+# Bumped when an existing cache FILE needs work that `CREATE TABLE IF NOT
+# EXISTS` cannot do. 1 = rebuild `pages_fts`, whose index was corrupted by the
+# `INSERT OR REPLACE` in the old `put_page` (see the comment there).
+_USER_VERSION = 1
+
+
 class Cache:
     # Opportunistic maintenance cadence: once at connection init, then every
     # N writes. No background tasks, so the stdio server lifecycle stays simple.
@@ -114,6 +132,7 @@ class Cache:
                 await conn.execute("PRAGMA synchronous=NORMAL")
                 await conn.execute("PRAGMA temp_store=MEMORY")
                 await conn.executescript(_SCHEMA)
+                await self._migrate(conn)
                 await conn.commit()
             except BaseException:
                 await conn.close()
@@ -211,12 +230,49 @@ class Cache:
                 await self._conn_obj.close()
                 self._conn_obj = None
 
+    @staticmethod
+    async def _migrate(conn: aiosqlite.Connection) -> None:
+        """Additive column migrations. Idempotent, cheap, never destructive.
+
+        `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already
+        exists, so a schema that grew after a user's cache file was created has
+        to be reconciled here. SQLite's `ADD COLUMN` is O(1) and backfills NULL,
+        which is the correct value for every pre-existing row: we genuinely do
+        not know the provenance of a result cached before we started recording
+        it.
+        """
+        cur = await conn.execute("PRAGMA table_info(search_cache)")
+        columns = {row[1] for row in await cur.fetchall()}
+        if "meta" not in columns:
+            await conn.execute("ALTER TABLE search_cache ADD COLUMN meta TEXT")
+
+        # One-time repair of caches written before `put_page` stopped using
+        # `INSERT OR REPLACE`. Those files carry orphaned `pages_fts` postings
+        # that make every `cache_search` raise, so the fix above only helps
+        # rows written from now on — the existing index still has to be
+        # rebuilt. `user_version` gates it to exactly once per file; the
+        # rebuild is O(corpus) and must not run on every start.
+        cur = await conn.execute("PRAGMA user_version")
+        row = await cur.fetchone()
+        if (row[0] if row else 0) < _USER_VERSION:
+            await conn.execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')")
+            await conn.execute(f"PRAGMA user_version={_USER_VERSION}")
+
     async def get_search(
         self, key: str, max_age_seconds: int | None = None,
-    ) -> list[dict[str, Any]] | None:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        """Cached results plus the provenance recorded alongside them.
+
+        Returns `(results, meta)`; `meta` is `{}` for rows written before the
+        `meta` column existed. Provenance is part of the ANSWER, not a
+        statistic about the run that produced it: a result set that only exists
+        because a captcha-walled engine was rescued via searx must still say so
+        on the cache-hit path, or the second identical query silently
+        re-labels a recovered result set as a normal one.
+        """
         conn = await self._conn()
         cur = await conn.execute(
-            "SELECT results, created FROM search_cache WHERE cache_key=?",
+            "SELECT results, created, meta FROM search_cache WHERE cache_key=?",
             (key,),
         )
         row = await cur.fetchone()
@@ -225,21 +281,36 @@ class Cache:
         ttl = max_age_seconds if max_age_seconds is not None else settings.cache_ttl_seconds
         if time.time() - row[1] > ttl:
             return None
-        return json.loads(row[0])
+        meta: dict[str, Any] = {}
+        if row[2]:
+            try:
+                loaded = json.loads(row[2])
+            except ValueError:
+                loaded = None
+            if isinstance(loaded, dict):
+                meta = loaded
+        return json.loads(row[0]), meta
 
     async def put_search(
-        self, key: str, query: str, engines: list[str], results: list[dict[str, Any]]
+        self,
+        key: str,
+        query: str,
+        engines: list[str],
+        results: list[dict[str, Any]],
+        meta: dict[str, Any] | None = None,
     ) -> None:
         conn = await self._conn()
         await conn.execute(
-            "INSERT OR REPLACE INTO search_cache (cache_key, query, engines, results, created) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO search_cache "
+            "(cache_key, query, engines, results, created, meta) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 key,
                 query,
                 ",".join(engines),
                 json.dumps(results, ensure_ascii=False),
                 int(time.time()),
+                json.dumps(meta, ensure_ascii=False) if meta else None,
             ),
         )
         await conn.commit()
@@ -263,14 +334,30 @@ class Cache:
 
     async def put_page(self, url: str, title: str | None, content: str) -> None:
         conn = await self._conn()
+        # UPSERT, deliberately NOT `INSERT OR REPLACE`. REPLACE resolves the
+        # url conflict by DELETING the old row and inserting a new one with a
+        # NEW rowid — and SQLite fires DELETE triggers on that path only when
+        # `recursive_triggers` is on, which it is not by default. So every
+        # re-fetch of a URL left the old rowid's postings orphaned in
+        # `pages_fts` while adding postings for the new one. External-content
+        # FTS5 reads column values back from `pages` by rowid, so the first
+        # orphan turned EVERY `cache_search` into
+        # `fts5: missing row N from content table` — swallowed by the
+        # malformed-query handler below and reported as "no cached pages
+        # match". `DO UPDATE` keeps the rowid and fires `pages_au`, which
+        # replaces exactly the one FTS row that changed.
         await conn.execute(
-            "INSERT OR REPLACE INTO pages (url, title, content, fetched) VALUES (?, ?, ?, ?)",
+            "INSERT INTO pages (url, title, content, fetched) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET "
+            "title=excluded.title, content=excluded.content, fetched=excluded.fetched",
             (url, title or "", content, int(time.time())),
         )
         await conn.commit()
         await self._bump_writes(conn)
 
-    async def search_pages(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+    async def search_pages(
+        self, query: str, limit: int = 10, *, _retrying: bool = False
+    ) -> list[dict[str, Any]]:
         conn = await self._conn()
         try:
             cur = await conn.execute(
@@ -280,7 +367,17 @@ class Cache:
                 (query, limit),
             )
             rows = await cur.fetchall()
-        except (sqlite3.OperationalError, aiosqlite.Error):
+        except (sqlite3.OperationalError, aiosqlite.Error) as exc:
+            if _is_fts_desync(exc) and not _retrying:
+                # NOT a malformed query: the index points at rows the content
+                # table no longer has. Rebuilding is the documented repair and
+                # is cheap relative to having the feature silently return
+                # nothing, which is what the blanket handler below did for
+                # every query against a desynced index.
+                log.warning("%s: rebuilding desynced FTS index (%s)", self._path, exc)
+                await conn.execute("INSERT INTO pages_fts(pages_fts) VALUES('rebuild')")
+                await conn.commit()
+                return await self.search_pages(query, limit, _retrying=True)
             # Malformed FTS5 MATCH input (e.g. 'a AND', a bare quote, or a
             # 'col:val' phrase against an unknown column) raises a SQLite
             # syntax error. Treat it as "no matches" rather than leaking raw

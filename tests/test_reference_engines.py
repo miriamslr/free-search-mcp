@@ -246,6 +246,40 @@ async def test_rate_limited_engine_is_skipped_and_reported(monkeypatch):
         "anything", engines=["gdelt"], max_results=3, use_cache=False
     )
     assert out["results"] == []
+    # ...and it must SAY so. The skip was recorded in diagnostics from the day
+    # the limiter landed but never read into the payload, so the engine simply
+    # vanished from a search it was still listed in `engines` for: no error, no
+    # `empty_engines` entry (it never reached `engine.search`, so it has no
+    # `raw_per_engine` row either), no hint. The caller read "this search found
+    # nothing" instead of "one source was throttled".
+    assert out["rate_limited_engines"] == ["gdelt"]
+    assert "throttling" in out["rate_limited_hint"]
+    assert "gdelt" in out["engines"]
+
+
+async def test_rate_limit_note_is_absent_on_a_healthy_search(monkeypatch):
+    """The key must not appear when nothing was actually skipped."""
+    from search_mcp import aggregator as agg
+    from search_mcp.engines import SearchResult
+
+    class _Stub:
+        name = "gdelt"
+
+        async def search(self, *a, **kw):
+            return [SearchResult("t", "https://e.example/1", "s", "gdelt", 1)]
+
+    monkeypatch.setattr(agg, "get_engine", lambda name: _Stub())
+
+    async def _allow(name, max_wait=None):
+        return True
+
+    monkeypatch.setattr(agg.search_limiter, "acquire", _allow)
+
+    out = await agg.aggregate_search(
+        "anything", engines=["gdelt"], max_results=3, use_cache=False
+    )
+    assert "rate_limited_engines" not in out
+    assert "rate_limited_hint" not in out
 
 
 # ---------------------------------------------------------------------------

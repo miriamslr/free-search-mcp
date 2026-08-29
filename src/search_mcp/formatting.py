@@ -64,12 +64,26 @@ def smart_truncate(text: str, max_chars: int) -> tuple[str, bool]:
 def render_search(payload: dict[str, Any]) -> str:
     """Render aggregator output as a numbered Markdown list with provenance."""
     query = payload.get("query", "")
-    engines = ", ".join(payload.get("engines") or [])
+    requested = payload.get("engines") or []
     results = payload.get("results") or []
     errors = payload.get("errors") or {}
     cached = payload.get("cached")
 
+    # The header names the engines that actually PRODUCED these results, not
+    # the ones that were asked to. `payload["engines"]` is the request — the
+    # list the cache key is built from — and when a requested engine fails the
+    # rescue pass substitutes another. Printing the request made the header
+    # claim `engines: nope_not_an_engine` above ten results that every
+    # per-result byline correctly attributed to `bing`.
+    contributed = list(
+        dict.fromkeys(e for r in results for e in (r.get("engines") or []))
+    )
+    engines = ", ".join(contributed or requested)
+
     lines = [f"# Search: {query}", "", f"_engines: {engines}_  _results: {len(results)}_"]
+    missing = [e for e in requested if e not in contributed]
+    if contributed and missing:
+        lines.append(f"_(requested but contributed nothing: {', '.join(missing)})_")
     if cached:
         lines.append("_(from cache)_")
     lines.append("")
@@ -147,6 +161,10 @@ def _render_search_hints(payload: dict[str, Any]) -> list[str]:
     if empty_hint:
         lines.append("")
         lines.append(f"⚠️ **Silent engines:** {empty_hint}")
+    rate_limited_hint = payload.get("rate_limited_hint")
+    if rate_limited_hint:
+        lines.append("")
+        lines.append(f"⚠️ **Rate-limited engines:** {rate_limited_hint}")
     rescued = payload.get("rescued_via")
     if rescued:
         lines.append("")
@@ -224,8 +242,11 @@ def render_fetch(result: dict[str, Any]) -> str:
     if byline:
         header.append(f"_{byline}_")
     header.append(meta_line)
-    header.append("")
-    return "\n".join(header) + content.rstrip() + "\n"
+    # Blank line between the metadata block and the body — "\n".join already
+    # ends the header with a single newline, so appending the content directly
+    # glued the page's first paragraph onto the italic meta line. render_doc
+    # gets this right; render_fetch did not, on every fetch/fetch_batch call.
+    return "\n".join(header) + "\n\n" + content.rstrip() + "\n"
 
 
 def render_doc(result: dict[str, Any]) -> str:
@@ -424,3 +445,148 @@ def errors_to_hint(errors: dict[str, str] | None) -> str | None:
         "If results are thin, retry the call with `engines=` set to the working ones, "
         "or rephrase the query."
     )
+
+
+def render_engines(
+    taxonomy: dict[str, dict[str, list[str]]],
+    descriptions: dict[str, str],
+    needs_key: set[str] | None = None,
+) -> str:
+    """Render the source taxonomy as a `group -> sub-group -> engine` tree.
+
+    Built entirely from what the registry reports, so it cannot drift the way
+    the hand-maintained buckets it replaces did — those advertised `pubmed` for
+    `category="paper"` while the engine limit kept it from ever running, and
+    never mentioned `openverse` or `zenodo`.
+    """
+    if not taxonomy:
+        return "No engines matched that group.\n"
+
+    keyed = needs_key or set()
+
+    def _bullets(names: list[str]) -> list[str]:
+        out = []
+        for n in names:
+            line = f"- `{n}` — {descriptions.get(n, '')}".rstrip(" —")
+            # Derived from the keystore's provider registry, not a second
+            # hand-kept list, so it can never disagree with what the admin UI
+            # asks the operator to configure.
+            if n in keyed:
+                line += " **(API key required)**"
+            out.append(line)
+        return out
+
+    lines: list[str] = []
+    for group, subs in taxonomy.items():
+        lines.append(f"## {group}")
+        # The "" bucket holds engines that declare the group and nothing
+        # narrower; it is empty whenever every engine in the group has a
+        # sub-group, so it must not leave a stray blank section behind.
+        ungrouped = subs.get("") or []
+        if ungrouped:
+            lines.append("")
+            lines.extend(_bullets(ungrouped))
+        for sub, names in subs.items():
+            if not sub:
+                continue
+            lines.append("")
+            lines.append(f"### {group}.{sub}")
+            lines.append("")
+            lines.extend(_bullets(names))
+        lines.append("")
+    lines.append(
+        "Pass a group or sub-group as `category=` to route automatically; pass a "
+        "name as `engines=[...]` to force one source."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _paper_graph_node(node: dict[str, Any], index: int) -> list[str]:
+    bits: list[str] = []
+    year = node.get("year")
+    if year:
+        bits.append(str(year))
+    cited = node.get("cited_by_count") or 0
+    if cited:
+        bits.append(f"cited by {cited}")
+    doi = node.get("doi")
+    if doi:
+        bits.append(f"doi:{doi}")
+    flag = " ⚠️ **RETRACTED**" if node.get("retracted") else ""
+    line = f"{index}. **{node.get('title') or '(untitled)'}**{flag}"
+    out = [line]
+    url = node.get("url")
+    if url:
+        out.append(f"   <{url}>")
+    if bits:
+        out.append(f"   _{' · '.join(bits)}_")
+    return out
+
+
+def render_paper_graph(payload: dict[str, Any]) -> str:
+    """Render a paper's citation neighbourhood.
+
+    References and citations get their own sections because they answer
+    different questions — what this stood on, and what stood on it — and the
+    retraction banner goes first, before anything a reader might quote.
+    """
+    paper = payload.get("paper")
+    notes = payload.get("notes") or []
+    if not paper:
+        head = f"# No paper matched `{payload.get('query', '')}`"
+        return "\n".join([head, ""] + [f"_{n}_" for n in notes]) + "\n"
+
+    lines: list[str] = []
+    if paper.get("retracted"):
+        lines.append("> ⚠️ **RETRACTED PAPER** — do not cite this as a standing result.")
+        lines.append("")
+
+    lines.append(f"# {paper.get('title') or '(untitled)'}")
+    lines.append("")
+    if paper.get("url"):
+        lines.append(f"<{paper['url']}>")
+    meta: list[str] = []
+    if paper.get("year"):
+        meta.append(str(paper["year"]))
+    meta.append(f"cited by {paper.get('cited_by_count', 0)}")
+    if paper.get("doi"):
+        meta.append(f"doi:{paper['doi']}")
+    if paper.get("openalex_id"):
+        meta.append(paper["openalex_id"])
+    lines.append(f"_{' · '.join(meta)}_")
+
+    crossref = paper.get("crossref") or {}
+    if crossref.get("registered") is False:
+        lines.append("")
+        lines.append(
+            "**Not in Crossref** — likely a DataCite DOI, so retraction notices "
+            "could not be checked."
+        )
+    for notice in crossref.get("notices") or []:
+        kind = str(notice.get("type", "")).replace("_", " ")
+        date = notice.get("date")
+        lines.append("")
+        lines.append(
+            f"**{kind.title()}** ({date or 'undated'}) — <https://doi.org/{notice.get('doi')}>"
+        )
+
+    for key, heading in (
+        ("references", "References (what it builds on)"),
+        ("citations", "Cited by (what built on it)"),
+    ):
+        nodes = payload.get(key) or []
+        if not nodes:
+            continue
+        lines.append("")
+        lines.append(f"## {heading}")
+        lines.append("")
+        for i, node in enumerate(nodes, 1):
+            lines.extend(_paper_graph_node(node, i))
+            lines.append("")
+        lines.pop()
+
+    if notes:
+        lines.append("")
+        for note in notes:
+            lines.append(f"_{note}_")
+    return "\n".join(lines) + "\n"

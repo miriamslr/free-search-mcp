@@ -28,6 +28,7 @@ class StackExchangeEngine(JsonApiEngine):
     """Stack Exchange Q&A search (keyless, optional app key)."""
 
     name = "stackexchange"
+    description = "Stack Overflow and the rest of the Stack Exchange Q&A network."
     categories = frozenset({"forum"})
 
     def build_url(

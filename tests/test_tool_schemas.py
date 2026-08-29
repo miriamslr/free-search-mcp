@@ -32,6 +32,7 @@ EXPECTED_TOOL_ORDER = [
     "fetch_batch",
     "read_doc",
     "research",
+    "paper_graph",
     "cache_search",
     "engines",
     "compare",
@@ -49,7 +50,9 @@ UNION_RETURNING_TOOLS = [
     "fetch_batch",
     "read_doc",
     "research",
+    "paper_graph",
     "cache_search",
+    "engines",
     "compare",
     "extract_structured",
 ]
@@ -159,16 +162,12 @@ async def test_fetch_opts_out_of_structured_output():
     assert "inline" in tool.input_schema["properties"]
 
 
-async def test_engines_tool_output_schema_is_a_wrapped_string_array():
+async def test_engines_tool_takes_a_group_and_a_format():
+    """`engines` follows the same `format=` convention as every other tool, and
+    can be narrowed to one group so the model does not have to read the whole
+    registry to pick a paper source."""
     tool = (await _tools_by_name())["engines"]
-    assert tool.output_schema == {
-        "properties": {
-            "result": {"items": {"type": "string"}, "title": "Result", "type": "array"}
-        },
-        "required": ["result"],
-        "title": "enginesOutput",
-        "type": "object",
-    }
+    assert set(tool.input_schema["properties"]) == {"group", "format"}
 
 
 async def test_every_tool_input_schema_is_an_object():
@@ -186,16 +185,36 @@ async def test_download_input_schema_has_no_policy_controls():
 # ---------------------------------------------------------------------------
 
 
-async def test_engines_call_returns_wrapped_structured_content():
-    blocks, structured = await call_tool("engines", {})
-    assert structured is not None, "engines advertises an output schema but returned none"
-    assert set(structured) == {"result"}
-    assert isinstance(structured["result"], list)
+async def test_engines_markdown_names_every_registered_engine():
+    """The rendered tree is derived from the registry, so it cannot omit an
+    engine the way the hand-maintained buckets it replaced did — those never
+    mentioned `openverse` or `zenodo`, and advertised `pubmed` for a category
+    the engine limit stopped it from ever running in."""
     from search_mcp.engines import ENGINES
 
-    assert structured["result"] == list(ENGINES)
-    # One text block per engine name, alongside the structured payload.
-    assert len(blocks) == len(ENGINES)
+    blocks, _structured = await call_tool("engines", {})
+    text = "\n".join(getattr(b, "text", "") or "" for b in blocks)
+    missing = [name for name in ENGINES if f"`{name}`" not in text]
+    assert not missing, missing
+
+
+async def test_engines_json_still_returns_the_flat_name_list():
+    """Programmatic callers keep the flat list they had before the taxonomy."""
+    from search_mcp.engines import ENGINES
+
+    _blocks, structured = await call_tool("engines", {"format": "json"})
+    payload = structured["result"] if set(structured) == {"result"} else structured
+    assert payload["engines"] == list(ENGINES)
+    assert set(payload["taxonomy"]) <= {"web", *{c.split(".")[0] for e in ENGINES.values() for c in e.categories}}
+    assert set(payload["descriptions"]) == set(ENGINES)
+
+
+async def test_engines_group_filter_narrows_to_one_group():
+    _blocks, structured = await call_tool("engines", {"group": "paper", "format": "json"})
+    payload = structured["result"] if set(structured) == {"result"} else structured
+    assert set(payload["taxonomy"]) == {"paper"}
+    assert "arxiv" in payload["engines"]
+    assert "duckduckgo" not in payload["engines"]
 
 
 async def test_markdown_format_returns_a_string_inside_the_wrapper(tmp_path, monkeypatch):

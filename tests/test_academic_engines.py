@@ -1,8 +1,8 @@
-"""arXiv / OpenAlex / Crossref / PubMed engines (offline).
+"""Scholarly engines (offline).
 
 Grouped in one module the way `test_parse_default_engines.py` groups the
-default HTML scrapers: these four share the `JsonApiEngine` base, so testing
-them together keeps the payload fixtures next to each other.
+default HTML scrapers: they all share the `JsonApiEngine` base, so testing them
+together keeps the payload fixtures next to each other.
 
 Fixtures are trimmed copies of real responses — the field quirks they encode
 (Crossref's `[[None]]` dates, OpenAlex's inverted abstracts, PubMed's
@@ -19,9 +19,14 @@ import pytest
 from search_mcp.engines import ENGINES, get_engine
 from search_mcp.engines.arxiv import ArxivEngine
 from search_mcp.engines.base import SearchFilters
+from search_mcp.engines.clinicaltrials import ClinicalTrialsEngine
 from search_mcp.engines.crossref import CrossrefEngine
+from search_mcp.engines.dblp import DblpEngine
+from search_mcp.engines.doaj import DoajEngine
+from search_mcp.engines.europepmc import EuropePmcEngine
 from search_mcp.engines.openalex import OpenAlexEngine
 from search_mcp.engines.pubmed import PubMedEngine
+from search_mcp.engines.semanticscholar import SemanticScholarEngine
 
 # pytest.ini sets `asyncio_mode = auto` so async tests are auto-marked.
 
@@ -30,7 +35,17 @@ skip_offline = pytest.mark.skipif(
     not NETWORK, reason="set SEARCH_MCP_TEST_NETWORK=1 to run"
 )
 
-ACADEMIC = ["arxiv", "openalex", "crossref", "pubmed"]
+ACADEMIC = [
+    "arxiv",
+    "openalex",
+    "crossref",
+    "pubmed",
+    "europepmc",
+    "semanticscholar",
+    "dblp",
+    "doaj",
+    "clinicaltrials",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +244,11 @@ _CROSSREF = {
                 "URL": "https://doi.org/10.1/z",
                 "issued": {"date-parts": [[None]]},
             },
+            {
+                "title": ["Year And A Gap"],
+                "URL": "https://doi.org/10.1/g",
+                "issued": {"date-parts": [[2024, None, 5]]},
+            },
             {"title": [], "URL": "https://doi.org/10.1/w"},
         ]
     }
@@ -247,10 +267,31 @@ def test_crossref_unwraps_list_titles():
     assert out[0].title == "The Triple Attention Transformer"
 
 
-def test_crossref_pads_partial_dates():
+def test_crossref_reports_dates_at_their_real_precision():
+    """A full Y-M-D is confident; a year-only record is NOT.
+
+    Year-only `issued` is extremely common. Padding it to `2024-01-01` and
+    flagging it confident let the freshness filter drop a paper actually issued
+    in December on the strength of a date Crossref never published — and showed
+    the reader a day the paper does not have. Open Library already takes this
+    line for its year-only dates.
+    """
     out = CrossrefEngine().map_results(_CROSSREF)
     assert out[0].published_age == "2024-02-05"
-    assert out[1].published_age == "2024-01-01"
+    assert out[0].published_age_confident is True
+    assert out[1].published_age == "2024"
+    assert out[1].published_age_confident is False
+
+
+def test_crossref_truncates_date_parts_at_the_first_gap():
+    """`date-parts` is positional: `[[2024, None, 5]]` means "2024, month
+    unknown". Filtering the Nones out instead of stopping at the first one
+    collapsed the list to `[2024, 5]` and promoted the DAY into the month
+    slot, reporting `2024-05-01`."""
+    out = CrossrefEngine().map_results(_CROSSREF)
+    assert out[3].title == "Year And A Gap"
+    assert out[3].published_age == "2024"
+    assert out[3].published_age_confident is False
 
 
 def test_crossref_missing_date_is_empty_not_confident():
@@ -274,7 +315,7 @@ def test_crossref_snippet_uses_publisher_when_no_container():
 
 def test_crossref_skips_entries_without_a_title():
     out = CrossrefEngine().map_results(_CROSSREF)
-    assert len(out) == 3
+    assert len(out) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +391,413 @@ async def test_pubmed_returns_empty_when_esearch_finds_nothing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Europe PMC
+# ---------------------------------------------------------------------------
+
+_EUROPEPMC = {
+    "hitCount": 228334,
+    "resultList": {
+        "result": [
+            {
+                "id": "38270601",
+                "source": "MED",
+                "pmid": "38270601",
+                "pmcid": "PMC10871810",
+                "doi": "10.1093/nar/gkae023",
+                "title": "CRISPR-Cas9 screening of proteins.",
+                "authorString": "Zhang Y, Liu Q, Chen X.",
+                "journalInfo": {"journal": {"title": "Nucleic Acids Res"}},
+                "abstractText": "We report a genome-wide screen.",
+                "firstPublicationDate": "2024-01-25",
+                "citedByCount": 42,
+                "isOpenAccess": "Y",
+                "fullTextUrlList": {
+                    "fullTextUrl": [
+                        {
+                            "availabilityCode": "OA",
+                            "documentStyle": "pdf",
+                            "url": "https://europepmc.org/articles/PMC10871810?pdf=render",
+                        },
+                        {
+                            "availabilityCode": "OA",
+                            "documentStyle": "html",
+                            "url": "https://europepmc.org/articles/PMC10871810",
+                        },
+                    ]
+                },
+            },
+            {
+                "id": "PPR812345",
+                "source": "PPR",
+                "doi": "10.1101/2026.01.01.000000",
+                "title": "A preprint about base editors",
+                "authorString": "Doe J.",
+                "firstPublicationDate": "2026-01-01",
+            },
+            {"id": "x", "source": "MED"},  # no title
+        ]
+    },
+}
+
+
+def test_europepmc_prefers_open_access_html_over_the_pdf():
+    """An HTML full text is what `read_doc` can actually open cheaply; the PDF
+    is the same content behind a much heavier fetch."""
+    out = EuropePmcEngine().map_results(_EUROPEPMC)
+    assert out[0].url == "https://europepmc.org/articles/PMC10871810"
+
+
+def test_europepmc_falls_back_to_the_record_page():
+    out = EuropePmcEngine().map_results(_EUROPEPMC)
+    assert out[1].url == "https://europepmc.org/article/PPR/PPR812345"
+
+
+def test_europepmc_flags_preprints_in_the_snippet():
+    """A preprint has not been peer reviewed, and a model quoting it must be
+    able to say so without opening the record."""
+    out = EuropePmcEngine().map_results(_EUROPEPMC)
+    assert out[1].snippet.startswith("PREPRINT")
+    assert "PREPRINT" not in out[0].snippet
+
+
+def test_europepmc_snippet_carries_journal_citations_and_access():
+    out = EuropePmcEngine().map_results(_EUROPEPMC)
+    assert "Nucleic Acids Res" in out[0].snippet
+    assert "cited by 42" in out[0].snippet
+    assert "open access" in out[0].snippet
+
+
+def test_europepmc_dates_are_confident():
+    out = EuropePmcEngine().map_results(_EUROPEPMC)
+    assert out[0].published_age == "2024-01-25"
+    assert out[0].published_age_confident is True
+
+
+def test_europepmc_skips_records_without_a_title():
+    assert len(EuropePmcEngine().map_results(_EUROPEPMC)) == 2
+
+
+@pytest.mark.parametrize(
+    ("token", "clause"),
+    [
+        ("paper.preprint", '%28SRC%3A%22PPR%22%29'),
+        ("paper.openaccess", '%28OPEN_ACCESS%3A%22Y%22%29'),
+    ],
+)
+def test_europepmc_sub_group_adds_an_index_side_clause(token, clause):
+    """The sub-group restriction is Europe PMC's own field syntax, so the index
+    does the narrowing — filtering here would return a page of the wrong hits
+    and then throw most of it away. bioRxiv's own API cannot keyword-search at
+    all, which is why preprint search runs through this clause."""
+    url = EuropePmcEngine().build_url(
+        "crispr", 10, SearchFilters(category="paper", category_token=token)
+    )
+    assert clause in url
+
+
+def test_europepmc_bare_group_adds_no_clause():
+    url = EuropePmcEngine().build_url(
+        "crispr", 10, SearchFilters(category="paper", category_token="paper")
+    )
+    assert "SRC" not in url and "OPEN_ACCESS" not in url
+
+
+def test_europepmc_freshness_becomes_a_date_range_clause():
+    url = EuropePmcEngine().build_url("crispr", 10, SearchFilters(freshness="week"))
+    assert "FIRST_PDATE" in url
+
+
+# ---------------------------------------------------------------------------
+# Semantic Scholar
+# ---------------------------------------------------------------------------
+
+_S2 = {
+    "total": 1234,
+    "data": [
+        {
+            "paperId": "204e3073870fae3d05bcbc2f6a8e263d9b72e776",
+            "title": "Attention Is All You Need",
+            "abstract": "The dominant sequence transduction models…",
+            "year": 2017,
+            "publicationDate": "2017-06-12",
+            "venue": "NeurIPS",
+            "citationCount": 100000,
+            "influentialCitationCount": 12000,
+            "isOpenAccess": True,
+            "openAccessPdf": {"url": "https://arxiv.org/pdf/1706.03762"},
+            "externalIds": {"DOI": "10.5555/3295222.3295349"},
+            "authors": [
+                {"name": "Ashish Vaswani"},
+                {"name": "Noam Shazeer"},
+                {"name": "Niki Parmar"},
+                {"name": "Jakob Uszkoreit"},
+            ],
+        },
+        {
+            "paperId": "abc",
+            "title": "Year only",
+            "year": 2019,
+            "externalIds": {"DOI": "10.1000/xyz"},
+        },
+    ],
+}
+
+
+def test_semanticscholar_stays_out_of_auto_routing_without_a_key(monkeypatch):
+    """The anonymous pool answered 429 on every attempt while this engine was
+    written. Spending one of `category_engine_limit`'s slots on a guaranteed
+    empty costs a real source — but naming it explicitly still runs it."""
+    from search_mcp.engines import semanticscholar as mod
+
+    monkeypatch.setattr(mod, "get_secret", lambda field: "")
+    assert SemanticScholarEngine().is_available() is False
+    monkeypatch.setattr(mod, "get_secret", lambda field: "k")
+    assert SemanticScholarEngine().is_available() is True
+
+
+def test_semanticscholar_sends_the_key_as_a_header(monkeypatch):
+    from search_mcp.engines import semanticscholar as mod
+
+    monkeypatch.setattr(mod, "get_secret", lambda field: "sekrit")
+    assert SemanticScholarEngine().api_headers == {"x-api-key": "sekrit"}
+    monkeypatch.setattr(mod, "get_secret", lambda field: "")
+    assert SemanticScholarEngine().api_headers == {}
+
+
+def test_semanticscholar_prefers_the_open_access_pdf():
+    out = SemanticScholarEngine().map_results(_S2)
+    assert out[0].url == "https://arxiv.org/pdf/1706.03762"
+    assert out[1].url == "https://doi.org/10.1000/xyz"
+
+
+def test_semanticscholar_snippet_reports_influential_citations():
+    out = SemanticScholarEngine().map_results(_S2)
+    assert "cited by 100000 (12000 influential)" in out[0].snippet
+    assert "Ashish Vaswani, Noam Shazeer, Niki Parmar et al." in out[0].snippet
+
+
+def test_semanticscholar_year_only_is_shown_but_not_trusted():
+    """Same convention as OpenLibrary and (since this release) Crossref: a bare
+    year is not precise enough for `freshness` to drop a result on."""
+    out = SemanticScholarEngine().map_results(_S2)
+    assert out[0].published_age == "2017-06-12"
+    assert out[0].published_age_confident is True
+    assert out[1].published_age == "2019"
+    assert out[1].published_age_confident is False
+
+
+def test_semanticscholar_asks_for_the_fields_it_renders():
+    url = SemanticScholarEngine().build_url("attention", 5)
+    for field in ("abstract", "citationCount", "openAccessPdf", "externalIds"):
+        assert field in url
+
+
+# ---------------------------------------------------------------------------
+# DBLP
+# ---------------------------------------------------------------------------
+
+_DBLP = {
+    "result": {
+        "hits": {
+            "@total": "27",
+            "hit": [
+                {
+                    "info": {
+                        "authors": {
+                            "author": [
+                                {"@pid": "1", "text": "Gordon V. Cormack"},
+                                {"@pid": "2", "text": "Charles L. A. Clarke"},
+                                {"@pid": "3", "text": "Stefan Büttcher"},
+                            ]
+                        },
+                        "title": "Reciprocal rank fusion outperforms Condorcet.",
+                        "venue": "SIGIR",
+                        "year": "2009",
+                        "type": "Conference and Workshop Papers",
+                        "doi": "10.1145/1571941.1572114",
+                        "ee": "https://doi.org/10.1145/1571941.1572114",
+                        "url": "https://dblp.org/rec/conf/sigir/CormackCB09",
+                    }
+                },
+                {
+                    "info": {
+                        # A single-author paper serialises `author` as an OBJECT.
+                        "authors": {"author": {"@pid": "9", "text": "Solo Writer"}},
+                        "title": "One author only",
+                        "year": "2021",
+                        "url": "https://dblp.org/rec/conf/x/Writer21",
+                    }
+                },
+            ],
+        }
+    }
+}
+
+
+def test_dblp_handles_a_single_author_serialised_as_an_object():
+    """DBLP's JSON is generated from XML, so a one-author record collapses the
+    list into a bare object — the classic XML-to-JSON trap."""
+    assert DblpEngine()._authors(_DBLP["result"]["hits"]["hit"][1]["info"]) == [
+        "Solo Writer"
+    ]
+
+
+def test_dblp_links_the_electronic_edition_not_the_record_page():
+    """`ee` is usually the DOI, i.e. the paper itself; the DBLP record is one
+    hop further away."""
+    out = DblpEngine().map_results(_DBLP)
+    assert out[0].url == "https://doi.org/10.1145/1571941.1572114"
+    assert out[1].url == "https://dblp.org/rec/conf/x/Writer21"
+
+
+def test_dblp_snippet_names_the_venue_and_year():
+    out = DblpEngine().map_results(_DBLP)
+    assert "SIGIR" in out[0].snippet and "2009" in out[0].snippet
+    assert out[0].title == "Reciprocal rank fusion outperforms Condorcet"
+
+
+def test_dblp_year_is_never_confident():
+    """DBLP records a year and nothing finer, so `freshness` must not drop on
+    it — the same rule the Crossref year-only fix established."""
+    out = DblpEngine().map_results(_DBLP)
+    assert out[0].published_age == "2009"
+    assert out[0].published_age_confident is False
+
+
+def test_dblp_declares_a_gentle_rate_limit_it_will_not_wait_on():
+    """Two quick queries during development came back throttled — as an EMPTY
+    body, which the never-raise rule turns into "no results"."""
+    engine = DblpEngine()
+    assert engine.rate_limit_per_minute == 20
+    assert engine.rate_limit_max_wait == 3.0
+
+
+# ---------------------------------------------------------------------------
+# DOAJ
+# ---------------------------------------------------------------------------
+
+_DOAJ = {
+    "total": 4021,
+    "results": [
+        {
+            "id": "0a1b2c3d",
+            "bibjson": {
+                "title": "Machine learning for\n  soil mapping",
+                "abstract": "We compare random forests and gradient boosting.",
+                "year": "2023",
+                "month": "4",
+                "author": [{"name": "A. Author"}, {"name": "B. Author"}],
+                "journal": {"title": "Open Soil Science"},
+                "identifier": [
+                    {"type": "doi", "id": "10.1234/oss.2023.1"},
+                    {"type": "eissn", "id": "1234-5678"},
+                ],
+                "link": [
+                    {"type": "fulltext", "url": "https://journal.example/article/1"}
+                ],
+            },
+        },
+        {
+            "id": "deadbeef",
+            "bibjson": {
+                "title": "No full text link",
+                "year": "2020",
+                "identifier": [{"type": "doi", "id": "10.1234/x"}],
+            },
+        },
+    ],
+}
+
+
+def test_doaj_query_is_path_encoded():
+    """The query lives in the URL PATH, so an unescaped "/" would change which
+    endpoint is called."""
+    url = DoajEngine().build_url("a/b c", 5)
+    assert url.startswith("https://doaj.org/api/search/articles/a%2Fb%20c?")
+
+
+def test_doaj_links_the_publisher_full_text_then_the_doi():
+    out = DoajEngine().map_results(_DOAJ)
+    assert out[0].url == "https://journal.example/article/1"
+    assert out[1].url == "https://doi.org/10.1234/x"
+
+
+def test_doaj_collapses_whitespace_in_titles():
+    out = DoajEngine().map_results(_DOAJ)
+    assert out[0].title == "Machine learning for soil mapping"
+
+
+def test_doaj_year_month_is_shown_but_not_trusted():
+    out = DoajEngine().map_results(_DOAJ)
+    assert out[0].published_age == "2023-04"
+    assert out[0].published_age_confident is False
+    assert out[1].published_age == "2020"
+
+
+# ---------------------------------------------------------------------------
+# ClinicalTrials.gov
+# ---------------------------------------------------------------------------
+
+_TRIALS = {
+    "totalCount": 312,
+    "studies": [
+        {
+            "protocolSection": {
+                "identificationModule": {
+                    "nctId": "NCT03548935",
+                    "briefTitle": "Semaglutide Effects on Body Weight",
+                },
+                "statusModule": {
+                    "overallStatus": "ACTIVE_NOT_RECRUITING",
+                    "startDateStruct": {"date": "2018-06-04", "type": "ACTUAL"},
+                },
+                "designModule": {
+                    "phases": ["PHASE3"],
+                    "enrollmentInfo": {"count": 1961, "type": "ACTUAL"},
+                },
+                "conditionsModule": {"conditions": ["Obesity", "Overweight"]},
+                "sponsorCollaboratorsModule": {"leadSponsor": {"name": "Novo Nordisk"}},
+                "descriptionModule": {"briefSummary": "This study looks at weight."},
+            }
+        },
+        # No identification module: nothing to link to or name.
+        {"protocolSection": {"statusModule": {"overallStatus": "COMPLETED"}}},
+    ],
+}
+
+
+def test_clinicaltrials_titles_carry_the_nct_id():
+    """The registry ID is how a trial is cited everywhere else, so it belongs
+    in the title rather than only in the URL."""
+    out = ClinicalTrialsEngine().map_results(_TRIALS)
+    assert len(out) == 1
+    assert out[0].title == "NCT03548935 — Semaglutide Effects on Body Weight"
+    assert out[0].url == "https://clinicaltrials.gov/study/NCT03548935"
+
+
+def test_clinicaltrials_snippet_leads_with_phase_status_and_enrolment():
+    """"What stage is this drug at" is usually the actual question."""
+    out = ClinicalTrialsEngine().map_results(_TRIALS)
+    assert out[0].snippet.startswith(
+        "Phase 3 · Active Not Recruiting · n=1961 · Obesity, Overweight · Novo Nordisk"
+    )
+
+
+def test_clinicaltrials_start_date_is_confident():
+    out = ClinicalTrialsEngine().map_results(_TRIALS)
+    assert out[0].published_age == "2018-06-04"
+    assert out[0].published_age_confident is True
+
+
+def test_clinicaltrials_requests_only_the_modules_it_renders():
+    """The default study record is tens of KB per hit — every outcome measure
+    and every site's contact details."""
+    url = ClinicalTrialsEngine().build_url("obesity", 5)
+    assert "fields=protocolSection.identificationModule" in url
+    assert "eligibilityModule" not in url
+
+
+# ---------------------------------------------------------------------------
 # Live network
 # ---------------------------------------------------------------------------
 
@@ -362,6 +810,10 @@ async def test_pubmed_returns_empty_when_esearch_finds_nothing(monkeypatch):
         ("openalex", "transformer attention"),
         ("crossref", "transformer attention"),
         ("pubmed", "crispr gene editing"),
+        ("europepmc", "crispr gene editing"),
+        ("dblp", "reciprocal rank fusion"),
+        ("doaj", "machine learning"),
+        ("clinicaltrials", "semaglutide obesity"),
     ],
 )
 async def test_live_returns_results(name, query):

@@ -31,7 +31,8 @@ class PubMedEngine(JsonApiEngine):
     """PubMed biomedical literature search (keyless NCBI E-utilities)."""
 
     name = "pubmed"
-    categories = frozenset({"paper"})
+    description = "PubMed — NCBI's biomedical and life-sciences citation index."
+    categories = frozenset({"paper", "paper.biomed"})
 
     def _identity(self) -> list[str]:
         """NCBI asks callers to declare a tool name and contact address."""
@@ -108,6 +109,9 @@ class PubMedEngine(JsonApiEngine):
             title = clip(item.get("title"), cap=300)
             if not title:
                 continue
+            # Once, not twice: the value and its confidence flag must never be
+            # able to drift apart.
+            pub_date = self._pub_date(item)
             results.append(
                 SearchResult(
                     title=title,
@@ -115,8 +119,8 @@ class PubMedEngine(JsonApiEngine):
                     snippet=self._snippet(item),
                     engine=self.name,
                     rank=0,
-                    published_age=self._pub_date(item),
-                    published_age_confident=bool(self._pub_date(item)),
+                    published_age=pub_date,
+                    published_age_confident=bool(pub_date),
                 )
             )
         return results

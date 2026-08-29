@@ -109,6 +109,11 @@ _FAKE_GOOGLE_HTML = """
   <div class="VwiC3b">Second snippet body about things.</div>
 </div>
 
+<div class="g" data-hveid="r3">
+  <a href="/url?esrc=s&amp;q=&amp;url=https%3A%2F%2Fexample.com%2Fc&amp;ved=xyz"><h3>Example C title</h3></a>
+  <div class="VwiC3b">Third snippet body, wrapped under `url=` not `q=`.</div>
+</div>
+
 <div class="g" data-hveid="rnav">
   <a href="/search?q=related+stuff"><h3>Related searches</h3></a>
   <div class="VwiC3b">Internal Google navigation.</div>
@@ -126,8 +131,13 @@ def test_parse_extracts_organic_and_skips_ads_and_internal():
     e = GoogleEngine()
     out = e.parse(_FAKE_GOOGLE_HTML)
     urls = [r.url for r in out]
-    # Ad + internal link skipped; /url?q= unwrapped; duplicate deduped.
-    assert urls == ["https://example.com/a", "https://example.com/b"]
+    # Ad + internal link skipped; both /url? wrapper forms unwrapped;
+    # duplicate deduped.
+    assert urls == [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ]
     assert out[0].title == "Example A title"
     assert out[0].snippet.startswith("First snippet body")
     assert out[1].title == "Example B title"
@@ -141,6 +151,27 @@ def test_parse_unwraps_url_redirect():
     out = e.parse(_FAKE_GOOGLE_HTML)
     b = [r for r in out if r.title == "Example B title"]
     assert b and b[0].url == "https://example.com/b"
+
+
+def test_parse_unwraps_the_url_keyed_redirect_form():
+    """Google also wraps links as `/url?esrc=s&q=&url=<target>&ved=...`.
+
+    `q` is PRESENT but empty there, and `parse_qs` drops blank values, so a
+    check that only looked at `q` let the whole wrapper through unchanged. The
+    model then received a relative path it cannot `fetch`, and because
+    `urlparse(...).hostname` is "" for it, every domain and category
+    post-filter silently discarded the result.
+    """
+    out = GoogleEngine().parse(_FAKE_GOOGLE_HTML)
+    c = [r for r in out if r.title == "Example C title"]
+    assert c and c[0].url == "https://example.com/c"
+
+
+def test_parse_never_emits_a_relative_url():
+    """Whatever survives unwrapping is absolutised against the Google origin."""
+    out = GoogleEngine().parse(_FAKE_GOOGLE_HTML)
+    assert out, "fixture should yield results"
+    assert all(r.url.startswith("https://") for r in out), [r.url for r in out]
 
 
 def test_parse_extracts_date_hint():

@@ -433,7 +433,18 @@ async def fetch_page(
     render: str = "auto",
     force_refresh: bool = False,
     inline: bool = False,
+    max_age_seconds: int | None = None,
 ) -> FetchResult:
+    """Fetch `url`, serving from the page cache when a fresh enough row exists.
+
+    `max_age_seconds` tightens the cache READ only (None = the server default
+    TTL); a fresh body is always written back. It is honoured HERE rather than
+    by the caller because the cache key is the *resolved* URL: a Google News
+    link is rewritten to its publisher below before anything touches the cache,
+    so a caller pre-checking the raw `news.google.com/...` URL could only ever
+    miss — and would then re-fetch, and re-pay the ~600 KB article-shell
+    resolve, on every single call.
+    """
     # Google News RSS/article links (news.google.com/.../articles/CBM...) are
     # opaque redirect blobs that resolve to an empty JS shell over both HTTP and
     # a headless browser — so fetch/research would otherwise return zero content
@@ -451,7 +462,7 @@ async def fetch_page(
     assert_url_allowed_offline(url)
 
     if not force_refresh:
-        cached = await cache.get_page(url)
+        cached = await cache.get_page(url, max_age_seconds=max_age_seconds)
         if cached:
             title, author, date, sitename = _decode_title_meta(cached.get("title"))
             content, truncated = _truncate(cached["content"])

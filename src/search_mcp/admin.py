@@ -84,6 +84,34 @@ _PROVIDER_ZH: dict[str, dict[str, object]] = {
             "创建密钥并粘贴到这里。",
         ],
     },
+    "semanticscholar": {
+        "label": "Semantic Scholar（可选密钥）",
+        "free_tier": "匿名共享额度实测长期 429；申请免费密钥后为每秒 1 次",
+        "how_to": [
+            "Semantic Scholar 是几个免密钥学术源里元数据最全的：摘要、被引数、开放获取 PDF 直链。",
+            "但它的匿名额度是一个共享池，实测基本一直处于限流状态，不填密钥通常拿不到结果。",
+            "在 semanticscholar.org/product/api 申请免费密钥，审核通过会发到邮箱（需要几天）。",
+            "把密钥粘贴到这里，category=\"paper\" 就会把它一起用上。",
+        ],
+    },
+    "github": {
+        "label": "GitHub（可选令牌）",
+        "free_tier": "仓库/议题搜索免令牌可用（10 次/分）；令牌提升到 30 次/分并解锁代码搜索",
+        "how_to": [
+            "github 引擎不带令牌也能搜索仓库和议题。",
+            "令牌会提高限额，并启用 github_code —— GitHub 的代码搜索接口直接拒绝匿名请求。",
+            "在 github.com/settings/tokens 创建，搜索公开仓库不需要任何 scope。",
+        ],
+    },
+    "stackexchange": {
+        "label": "Stack Exchange（可选密钥）",
+        "free_tier": "匿名每天 300 次；填写密钥后每天 10,000 次",
+        "how_to": [
+            "不填密钥也能用，只是每天 300 次配额按 IP 共享。",
+            "在 stackapps.com/apps/oauth/register 注册应用即可拿到 key。",
+            "把 key 粘贴到这里。",
+        ],
+    },
 }
 
 _FIELD_ZH: dict[str, str] = {
@@ -93,6 +121,9 @@ _FIELD_ZH: dict[str, str] = {
     "google_cse_api_key": "API 密钥",
     "google_cse_cx": "搜索引擎 ID (cx)",
     "anysearch_api_key": "API 密钥（可选）",
+    "semanticscholar_api_key": "API 密钥（可选，强烈建议填写）",
+    "github_token": "个人访问令牌（可选）",
+    "stackexchange_key": "API 密钥（可选）",
     "proxy": "代理 URL",
     "proxy_engines": "仅代理这些引擎（可选，逗号分隔）",
 }

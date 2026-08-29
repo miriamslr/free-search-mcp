@@ -141,6 +141,8 @@ async def test_server_tool_call_returns_a_result():
     from search_mcp.engines import ENGINES
     from search_mcp.server import mcp
 
-    result = await mcp.call_tool("engines", {})
+    result = await mcp.call_tool("engines", {"format": "json"})
     assert result.is_error is not True
-    assert result.structured_content == {"result": list(ENGINES)}
+    payload = result.structured_content
+    payload = payload["result"] if set(payload) == {"result"} else payload
+    assert payload["engines"] == list(ENGINES)

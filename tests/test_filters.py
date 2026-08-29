@@ -391,3 +391,60 @@ async def test_live_exclude_text_removes_hits():
         assert "beginner" not in haystack, r
     # Sanity: filtering shouldn't add brand-new URLs.
     assert filtered_urls.issubset(base_urls) or base_urls.issubset(filtered_urls) or True
+
+
+# --- publisher subdomains that are not papers ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("host", "scholarly"),
+    [
+        # The presses run dictionaries and bookshops on the same domain as
+        # their journals, and `_host_matches` accepts any subdomain of an
+        # allowlist entry. Measured: `category="paper"` on "what is reciprocal
+        # rank fusion" dropped 54 of 56 raw results and kept Cambridge
+        # Dictionary's entry for the WORD "reciprocal" as its single source.
+        ("dictionary.cambridge.org", False),
+        ("global.oup.com", False),
+        ("us.sagepub.com", False),
+        # The journal sides of the same publishers must still pass.
+        ("www.cambridge.org", True),
+        ("academic.oup.com", True),
+        ("journals.sagepub.com", True),
+        # And the rest of the list is untouched.
+        ("arxiv.org", True),
+        ("doi.org", True),
+        ("example.com", False),
+    ],
+)
+def test_publisher_subdomains_that_are_not_scholarly(host, scholarly):
+    from search_mcp.engines.base import _is_paper_host
+
+    assert _is_paper_host(host) is scholarly
+
+
+def test_a_dictionary_entry_is_dropped_from_a_paper_search():
+    """End to end through the post-filter, not just the host predicate."""
+    from search_mcp.engines.base import SearchFilters, apply_post_filters_with_diagnostics
+
+    results = [
+        SearchResult(
+            title="RECIPROCAL | English meaning - Cambridge Dictionary",
+            url="https://dictionary.cambridge.org/dictionary/english/reciprocal",
+            snippet="RECIPROCAL definition",
+            engine="duckduckgo",
+            rank=1,
+        ),
+        SearchResult(
+            title="Reciprocal rank fusion",
+            url="https://doi.org/10.1145/1571941.1572114",
+            snippet="",
+            engine="crossref",
+            rank=2,
+        ),
+    ]
+    kept, drops = apply_post_filters_with_diagnostics(
+        results, SearchFilters(category="paper")
+    )
+    assert [r.url for r in kept] == ["https://doi.org/10.1145/1571941.1572114"]
+    assert drops["category_paper"] == 1
