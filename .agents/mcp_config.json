@@ -1,9 +1,5 @@
 {
   "mcpServers": {
-    "free-search-local": {
-      "command": "uv",
-      "args": ["run", "search-mcp"]
-    },
     "free-search-cloudflare": {
       "serverUrl": "https://free-search-mcp.acellere-mcps.workers.dev/mcp",
       "url": "https://free-search-mcp.acellere-mcps.workers.dev/mcp",
