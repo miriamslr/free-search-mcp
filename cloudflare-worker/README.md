@@ -1,31 +1,24 @@
-# Free Search MCP para Cloudflare
+# Free Search MCP para Cloudflare (Produção)
 
-Reimplementacao Cloudflare-native do nucleo do projeto Python. A versao inicial oferece MCP remoto por HTTP com as ferramentas search, fetch e research.
+Reimplementação Cloudflare-native do núcleo do projeto Python. O serviço roda em produção no Cloudflare Workers com suporte a HTTP/SSE, cache KV persistente e ferramentas `search`, `fetch` e `research`.
 
-## Publicar
+Para a documentação completa de arquitetura, credenciais e integrações (ChatGPT, Antigravity, Claude), consulte:
+📄 **[Documentação de Produção (docs/CLOUDFLARE_PRODUCTION.md)](../docs/CLOUDFLARE_PRODUCTION.md)**
+
+## Resumo de Produção
+
+- **Conta:** `Acellere MCPs` (`2bbf9af1af4a1d1466579ae28267a9b8`)
+- **URL Base:** `https://free-search-mcp.acellere-mcps.workers.dev`
+- **Endpoint MCP:** `https://free-search-mcp.acellere-mcps.workers.dev/mcp`
+- **Health Check:** `https://free-search-mcp.acellere-mcps.workers.dev/health`
+- **KV Cache:** `CACHE` (`790321ef91b444819322653058c8e1cc`)
+
+## Comandos
 
 ~~~bash
 cd cloudflare-worker
 npm install
-npx wrangler login
-npx wrangler secret put MCP_AUTH_TOKEN
 npm run typecheck
 npm test
 npm run deploy
 ~~~
-
-Nunca coloque o token no wrangler.jsonc ou no GitHub.
-
-Teste o endpoint publico de saude em /health. O MCP fica em /mcp e exige o cabecalho Authorization: Bearer SEU_TOKEN.
-
-## Cache opcional
-
-Crie um namespace com npx wrangler kv namespace create CACHE e adicione o binding CACHE ao wrangler.jsonc. Sem KV, o Worker funciona sem cache persistente.
-
-## Seguranca
-
-URLs locais, redes privadas, protocolos fora de HTTP(S), credenciais embutidas e redirecionamentos perigosos sao recusados. Downloads e arquivos binarios nao fazem parte desta versao.
-
-## Escopo
-
-O Python original continua intacto. Esta versao ainda nao inclui PDF/Office, mecanismos academicos, downloads, Browser Run nem paridade com as onze ferramentas originais.
