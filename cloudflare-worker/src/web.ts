@@ -20,8 +20,9 @@ async function fetchLimited(url: URL, maxBytes = 1500000): Promise<Response> {
   let current = url;
   for (let redirects = 0; redirects < 4; redirects++) {
     const response = await fetch(current, { redirect: "manual", headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; FreeSearchMCP/0.1)",
-      "Accept": "text/html,application/xhtml+xml"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     }});
     if ([301,302,303,307,308].includes(response.status)) {
       const location = response.headers.get("Location");
