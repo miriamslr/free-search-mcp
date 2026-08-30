@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "free-search-mcp",
+  "account_id": "2bbf9af1af4a1d1466579ae28267a9b8",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-30",
   "workers_dev": true,
