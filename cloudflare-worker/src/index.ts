@@ -7,7 +7,13 @@ const tools = [
   {name:"fetch",description:"Abre uma URL publica e extrai o texto. Nao acessa redes locais.",inputSchema:{type:"object",properties:{url:{type:"string"},max_chars:{type:"integer",minimum:1000,maximum:50000}},required:["url"]}},
   {name:"research",description:"Pesquisa um tema e le as melhores paginas em uma chamada.",inputSchema:{type:"object",properties:{question:{type:"string"},depth:{type:"integer",minimum:1,maximum:5}},required:["question"]}}
 ];
-const json = (body:unknown,status=200) => new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json; charset=utf-8","cache-control":"no-store"}});
+const corsHeaders: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+const json = (body:unknown,status=200) => new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json; charset=utf-8","cache-control":"no-store",...corsHeaders}});
 const result = (id:unknown,data:unknown) => json({jsonrpc:"2.0",id,result:data});
 const rpcError = (id:unknown,code:number,message:string,status=200) => json({jsonrpc:"2.0",id,error:{code,message}},status);
 const content = (value:unknown) => ({content:[{type:"text",text:typeof value === "string" ? value : JSON.stringify(value,null,2)}]});
@@ -37,17 +43,21 @@ async function callTool(env:Env,name:string,args:Record<string,unknown>) {
 
 export default {
   async fetch(request:Request,env:Env):Promise<Response> {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
     const url=new URL(request.url);
     if (url.pathname==="/health") return json({ok:true,service:"free-search-mcp-cloudflare",version:"0.1.0"});
-    if (url.pathname!=="/mcp") return new Response("Not found",{status:404});
+    if (url.pathname!=="/mcp" && url.pathname!=="/sse") return new Response("Not found",{status:404,headers:corsHeaders});
     if (!allowedOrigin(request,env.MCP_ALLOWED_ORIGINS)) return json({error:"Origin nao permitida."},403);
     if (!authorized(request,env.MCP_AUTH_TOKEN)) return json({error:"Nao autorizado."},401);
-    if (request.method!=="POST") return new Response("Method not allowed",{status:405,headers:{Allow:"POST"}});
+    if (request.method==="GET") return json({status:"ready",service:"free-search-mcp-cloudflare",tools});
+    if (request.method!=="POST") return new Response("Method not allowed",{status:405,headers:{Allow:"POST, GET, OPTIONS",...corsHeaders}});
     let rpc:{id?:unknown;method?:string;params?:Record<string,unknown>};
     try { rpc=await request.json(); } catch { return rpcError(null,-32700,"JSON invalido.",400); }
     try {
       if (rpc.method==="initialize") return result(rpc.id,{protocolVersion:"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"free-search-mcp-cloudflare",version:"0.1.0"}});
-      if (rpc.method==="notifications/initialized") return new Response(null,{status:202});
+      if (rpc.method==="notifications/initialized") return new Response(null,{status:202,headers:corsHeaders});
       if (rpc.method==="ping") return result(rpc.id,{});
       if (rpc.method==="tools/list") return result(rpc.id,{tools});
       if (rpc.method==="tools/call") {

@@ -22,5 +22,9 @@ export function allowedOrigin(request: Request, configured = ""): boolean {
 }
 
 export function authorized(request: Request, token?: string): boolean {
-  return Boolean(token) && request.headers.get("Authorization") === "Bearer " + token;
+  if (!token) return true;
+  if (request.headers.get("Authorization") === "Bearer " + token) return true;
+  const url = new URL(request.url);
+  const queryToken = url.searchParams.get("token") || url.searchParams.get("key") || url.searchParams.get("auth");
+  return queryToken === token;
 }
