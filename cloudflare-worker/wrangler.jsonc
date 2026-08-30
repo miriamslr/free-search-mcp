@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "free-search-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-30",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": { "MCP_ALLOWED_ORIGINS": "", "SEARCH_CACHE_TTL_SECONDS": "3600" }
+}
